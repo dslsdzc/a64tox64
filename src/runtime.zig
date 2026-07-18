@@ -151,7 +151,6 @@ pub const JitRuntime = struct {
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
         const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
-        // Set chain info based on last opcode
         tb.chain_type = switch (last_opcode) {
             .b => .direct,
             .b_cond => .cond,
@@ -161,6 +160,33 @@ pub const JitRuntime = struct {
         tb.chain_target = last_target;
         tb.fallthrough_pc = pc;
         try runtime.cache.insert(tb);
+
+        // Hardware chaining: patch JMP placeholders if target already translated
+        if (emitted.len >= 5 and last_opcode != .ret_ and last_opcode != .svc) {
+            const branch_kind: enum { jmp, jcc, call, none } = brk: {
+                if (emitted.len >= 5) {
+                    if (emitted[emitted.len - 5] == 0xE9) break :brk .jmp;
+                    if (emitted[emitted.len - 5] == 0xE8) break :brk .call;
+                }
+                if (emitted.len >= 6 and emitted[emitted.len - 6] == 0x0F) {
+                    const second = emitted[emitted.len - 5];
+                    if (second >= 0x80 and second <= 0x8F) break :brk .jcc;
+                }
+                break :brk .none;
+            };
+            // Only chain direct JMP (B). JCC needs fallthrough, CALL needs return handling.
+            if (branch_kind == .jmp and tb.chain_type == .direct) {
+                const patch_offset = emitted.len - 4; // rel32 is always last 4 bytes
+                // Try to link to target if already translated
+                if (runtime.cache.lookup(tb.chain_target)) |target_blk| {
+                    const src_end = @intFromPtr(emitted.ptr) + emitted.len;
+                    const target_addr = @intFromPtr(target_blk.host_addr.ptr);
+                    const rel32: i32 = @intCast(target_addr - src_end);
+                    std.mem.writeInt(i32, emitted[patch_offset..][0..4], rel32, .little);
+                }
+            }
+        }
+
         runtime.last_block_was_svc = ends_with_svc;
         runtime.last_block_next_pc = pc;
         return tb;
