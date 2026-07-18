@@ -433,6 +433,118 @@ fn emitNZCVRead(ctx: *EmitContext, op: IROp) void {
     _ = op;
 }
 
+// ── CCMP (conditional compare) ──────────────────────────────────────
+
+fn emitPushf(ctx: *EmitContext) void {
+    ctx.byte(0x9C); // PUSHFQ
+}
+
+fn emitPopf(ctx: *EmitContext) void {
+    ctx.byte(0x9D); // POPFQ
+}
+
+fn emitAndRaxImm(ctx: *EmitContext, imm: u32) void {
+    ctx.rex(true, 0, 0, 0);
+    ctx.byte(0x25);
+    ctx.bytes(std.mem.asBytes(&imm));
+}
+
+fn emitOrRaxImm(ctx: *EmitContext, imm: u32) void {
+    ctx.rex(true, 0, 0, 0);
+    ctx.byte(0x0D);
+    ctx.bytes(std.mem.asBytes(&imm));
+}
+
+/// Map 4-bit NZCV to x86-64 RFLAGS bits.
+/// N→SF(7), Z→ZF(6), C→CF(0), V→OF(11)
+fn nzcvToRflags(nzcv: u32) u32 {
+    var flags: u32 = 0;
+    // C flag → CF bit 0
+    if (nzcv & 1 != 0) flags |= 1;
+    // V flag → OF bit 11
+    if (nzcv & 2 != 0) flags |= 1 << 11;
+    // Z flag → ZF bit 6
+    if (nzcv & 4 != 0) flags |= 1 << 6;
+    // N flag → SF bit 7
+    if (nzcv & 8 != 0) flags |= 1 << 7;
+    return flags;
+}
+
+/// CCMP: compare if condition true, else set NZCV from immediate.
+/// Emits: Jcc_else → CMP+CMC+JMP | PUSHFQ+AND+OR+POPFQ
+fn emitCCmp(ctx: *EmitContext, op: IROp) void {
+    // op.flags = ARM64 condition to check
+    // op.src0 = rn, op.src1 = rm
+    // op.imm = 4-bit NZCV value
+    const cond = op.flags & 0xF;
+    const nzcv_val = op.imm & 0xF;
+
+    // x86 condition inverse of ARM64 cond
+    const inv_cc: u8 = switch (cond) {
+        0b0000 => 0x85, // EQ → JNE (0F 85)
+        0b0001 => 0x84, // NE → JE (0F 84)
+        0b0010 => 0x82, // CS → JB (0F 82) — C=1 → fall through if C=0
+        0b0011 => 0x83, // CC → JAE (0F 83)
+        0b0100 => 0x89, // MI → JNS (0F 89)
+        0b0101 => 0x88, // PL → JS (0F 88)
+        0b0110 => 0x81, // VS → JNO (0F 81)
+        0b0111 => 0x80, // VC → JO (0F 80)
+        0b1000 => 0x86, // HI → JBE (0F 86)
+        0b1001 => 0x87, // LS → JA (0F 87)
+        0b1010 => 0x8C, // GE → JL (0F 8C)
+        0b1011 => 0x8D, // LT → JGE (0F 8D)
+        0b1100 => 0x8E, // GT → JLE (0F 8E)
+        0b1101 => 0x8F, // LE → JG (0F 8F)
+        0b1110 => return, // AL → always, just CMP (skip CCMP pattern)
+        else => 0x85, // default to JNE
+    };
+
+    // We'll emit Jcc_else with placeholder, then CMP+CMC, JMP+placeholder,
+    // then PUSHFQ...POPFQ.
+    // Patch the jump offsets after we know how long each path is.
+
+    ctx.byte(0x0F);
+    ctx.byte(inv_cc);
+    const else_rel32_off = ctx.offset; // placeholder
+    ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 });
+    const else_branch_end = ctx.offset;
+
+    // ── Condition met path: CMP + CMC ────────────────────────────
+    const rn = mapReg(ctx.regmap, op.src0);
+    const rm = mapReg(ctx.regmap, op.src1);
+    // CMP rn, rm (SUB r/m64, r64)
+    ctx.rex(true, @intFromEnum(rm), 0, @intFromEnum(rn));
+    ctx.byte(0x39);
+    ctx.modrm(0b11, @intFromEnum(rm), @intFromEnum(rn));
+    ctx.byte(0xF5); // CMC
+    ctx.byte(0xE9); // JMP rel32
+    const end_rel32_off = ctx.offset;
+    ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 });
+    const end_of_jmp = ctx.offset;
+
+    // ── Condition NOT met path: set NZCV from immediate ──────────
+    const else_path_start = ctx.offset;
+    emitPushf(ctx);
+    emitPopf(ctx); // pop into RAX
+    const mask = ~(@as(u32, 1) | (1 << 6) | (1 << 7) | (1 << 11)); // clear CF,ZF,SF,OF
+    emitAndRaxImm(ctx, mask);
+    const flags_val = nzcvToRflags(nzcv_val);
+    if (flags_val != 0) {
+        emitOrRaxImm(ctx, flags_val);
+    }
+    emitPushf(ctx);
+    emitPopf(ctx);
+    const else_path_end = ctx.offset;
+
+    // ── Patch branch offsets ─────────────────────────────────────
+    // Jcc_else → else_path_start
+    const else_rel32: i32 = @intCast(else_path_start - else_branch_end);
+    std.mem.writeInt(i32, ctx.buf[else_rel32_off..][0..4], else_rel32, .little);
+    // JMP .end → else_path_end
+    const end_rel32: i32 = @intCast(else_path_end - end_of_jmp);
+    std.mem.writeInt(i32, ctx.buf[end_rel32_off..][0..4], end_rel32, .little);
+}
+
 // ── Main dispatch ──────────────────────────────────────────────────
 
 pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
@@ -467,6 +579,7 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .call_reg => emitCallReg(ctx, op),
         .ret_ => emitRet(ctx),
         .br_cond => emitBrCond(ctx, op),
+        .ccmp => emitCCmp(ctx, op),
 
         .nzcv_update => emitNZCVUpdate(ctx, op),
         .nzcv_read => emitNZCVRead(ctx, op),

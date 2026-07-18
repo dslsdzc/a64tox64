@@ -540,11 +540,18 @@ fn buildBCond(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest
 }
 
 fn buildCCmp(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
-    // CCMP: conditional compare — sets NZCV if condition is met
-    // Simplified: always compare (ignoring condition for now)
+    // CCMP Xn, Xm, #nzcv, cond
+    //   if cond true:  NZCV = Xn - Xm  (compare)
+    //   if cond false: NZCV = nzcv_imm
+    //
+    // Single IR op: the emitter emits JCC→CMP+CMC vs PUSHFQ/POPFQ
     const ops = inst.operands.ccmp;
-    try buf.append(allocator, .{ .tag = .sub_i64, .dest = 0x1F, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = @as(u32, ops.nzcv) });
+    try buf.append(allocator, .{
+        .tag = .ccmp, .dest = 0,
+        .src0 = ops.rn, .src1 = ops.rm,
+        .flags = @intFromEnum(ops.cond),
+        .imm = ops.nzcv,
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════

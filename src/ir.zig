@@ -57,6 +57,7 @@ pub const Tag = enum(u16) {
     call,
     call_reg,
     ret_,
+    ccmp,
 
     // ── SIMD / FP ────────────────────────────────────────────────────
     vadd,
