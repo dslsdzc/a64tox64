@@ -32,9 +32,9 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .adr, .adrp => try buildAdr(buf, allocator, inst, guest_pc),
 
         // ── ALU register ─────────────────────────────────────────
-        .add_reg => try buildAddSubReg(buf, allocator, inst, .add_i64),
+        .add_reg, .add_ext => try buildAddSubReg(buf, allocator, inst, .add_i64),
         .adc_reg => try buildAddSubReg(buf, allocator, inst, .adc_i64),
-        .sub_reg => try buildAddSubReg(buf, allocator, inst, .sub_i64),
+        .sub_reg, .sub_ext => try buildAddSubReg(buf, allocator, inst, .sub_i64),
         .sbc_reg => try buildAddSubReg(buf, allocator, inst, .sbc_i64),
         .adds_reg => try buildAddSubRegFlags(buf, allocator, inst, .add_i64),
         .subs_reg => try buildAddSubRegFlags(buf, allocator, inst, .sub_i64),
