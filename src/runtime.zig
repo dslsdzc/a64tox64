@@ -185,6 +185,9 @@ pub const JitRuntime = struct {
         runtime.last_block_pc = 0; // consumed
 
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
+        if (emitted.len >= 10 and emitted[0] == 0x49 and emitted[1] == 0xBE) {
+            std.mem.writeInt(u64, emitted[2..10], @intFromPtr(&runtime.state), .little);
+        }
 const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
         tb.regmap = regmap;
