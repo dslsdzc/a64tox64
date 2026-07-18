@@ -23,15 +23,17 @@ pub const Opcode = enum(u16) {
 
     // Data processing — register
     add_reg,
+    adds_reg,
     adc_reg,
     sub_reg,
+    subs_reg,
     sbc_reg,
-    add_ext,
-    sub_ext,
     mul,
     mneg,
     and_reg,
+    ands_reg,
     bic_reg,
+    bics_reg,
     orr_reg,
     orn_reg,
     eor_reg,
@@ -255,14 +257,20 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0x7FE00000, .value = 0xCB000000, .opcode = .sub_reg },  // SUB (register, 64-bit)
     .{ .mask = 0x7FE00000, .value = 0x5A000000, .opcode = .sbc_reg },  // SBC (register, 32-bit)
     .{ .mask = 0x7FE00000, .value = 0xDA000000, .opcode = .sbc_reg },  // SBC (register, 64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x2B000000, .opcode = .add_ext },  // ADD (extend, 32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xAB000000, .opcode = .add_ext },  // ADD (extend, 64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x6B000000, .opcode = .sub_ext },  // SUB (extend, 32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xEB000000, .opcode = .sub_ext },  // SUB (extend, 64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x0A000000, .opcode = .and_reg },  // AND (register, 32-bit)
-    .{ .mask = 0x7FE00000, .value = 0x8A000000, .opcode = .and_reg },  // AND (register, 64-bit)
+    // ADDS/SUBS register (flag-setting)
+    .{ .mask = 0x7FE00000, .value = 0x2B000000, .opcode = .adds_reg }, // ADDS (register, 32-bit)
+    .{ .mask = 0x7FE00000, .value = 0xAB000000, .opcode = .adds_reg }, // ADDS (register, 64-bit)
+    .{ .mask = 0x7FE00000, .value = 0x6B000000, .opcode = .subs_reg }, // SUBS (register, 32-bit)
+    .{ .mask = 0x7FE00000, .value = 0xEB000000, .opcode = .subs_reg }, // SUBS (register, 64-bit)
+    // Logical (register)
+    .{ .mask = 0x7FE00000, .value = 0x0A000000, .opcode = .and_reg },  // AND (32-bit)
+    .{ .mask = 0x7FE00000, .value = 0x8A000000, .opcode = .and_reg },  // AND (64-bit)
+    .{ .mask = 0x7FE00000, .value = 0x6A000000, .opcode = .ands_reg }, // ANDS (32-bit)
+    .{ .mask = 0x7FE00000, .value = 0xEA000000, .opcode = .ands_reg }, // ANDS (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x0A200000, .opcode = .bic_reg },  // BIC (32-bit)
     .{ .mask = 0x7FE00000, .value = 0x8A200000, .opcode = .bic_reg },  // BIC (64-bit)
+    .{ .mask = 0x7FE00000, .value = 0x6A200000, .opcode = .bics_reg }, // BICS (32-bit)
+    .{ .mask = 0x7FE00000, .value = 0xEA200000, .opcode = .bics_reg }, // BICS (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x2A000000, .opcode = .orr_reg },  // ORR (32-bit)
     .{ .mask = 0x7FE00000, .value = 0xAA000000, .opcode = .orr_reg },  // ORR (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x2A200000, .opcode = .orn_reg },  // ORN (32-bit)
@@ -279,8 +287,6 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0x7FE00000, .value = 0x9AC00C00, .opcode = .sdiv },     // SDIV (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x1AC00800, .opcode = .udiv },     // UDIV (32-bit)
     .{ .mask = 0x7FE00000, .value = 0x9AC00800, .opcode = .udiv },     // UDIV (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x6B000000, .opcode = .cmp_reg },  // CMP (32-bit, SUBS XZR)
-    .{ .mask = 0x7FE00000, .value = 0xEB000000, .opcode = .cmp_reg },  // CMP (64-bit, SUBS XZR)
 
     // ── Shift by register ──────────────────────────────────────
     .{ .mask = 0x7FE00000, .value = 0x1AC02000, .opcode = .lsl_reg },  // LSLV (32-bit)
@@ -361,9 +367,8 @@ fn extractOperands(raw: u32, opcode: Opcode) Operands {
         .add_imm, .sub_imm => extractRRI12(raw),
         .movz, .movk, .movn => extractMovImm(raw),
         .adr, .adrp => extractADR(raw),
-        .add_reg, .adc_reg, .sub_reg, .sbc_reg => extractRRR(raw),
-        .add_ext, .sub_ext => extractExtend(raw),
-        .and_reg, .bic_reg, .orr_reg, .orn_reg, .eor_reg, .eon_reg => extractRRRShift(raw),
+        .add_reg, .adds_reg, .adc_reg, .sub_reg, .subs_reg, .sbc_reg => extractRRR(raw),
+        .and_reg, .ands_reg, .bic_reg, .bics_reg, .orr_reg, .orn_reg, .eor_reg, .eon_reg => extractRRRShift(raw),
         .mul, .mneg, .sdiv, .udiv => extractRRR(raw),
         .lsl_reg, .lsr_reg, .asr_reg, .ror_reg => extractRRR(raw),
         .cmp_reg, .cmn_reg, .neg_reg => extractCmp(raw),

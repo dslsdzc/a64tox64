@@ -36,12 +36,14 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .adc_reg => try buildAddSubReg(buf, allocator, inst, .adc_i64),
         .sub_reg => try buildAddSubReg(buf, allocator, inst, .sub_i64),
         .sbc_reg => try buildAddSubReg(buf, allocator, inst, .sbc_i64),
-        .add_ext => try buildAddSubReg(buf, allocator, inst, .add_i64),
-        .sub_ext => try buildAddSubReg(buf, allocator, inst, .sub_i64),
+        .adds_reg => try buildAddSubRegFlags(buf, allocator, inst, .add_i64),
+        .subs_reg => try buildAddSubRegFlags(buf, allocator, inst, .sub_i64),
         .and_reg => try buildLogical(buf, allocator, inst, .and_),
+        .ands_reg => try buildLogicalFlags(buf, allocator, inst, .and_),
         .orr_reg => try buildLogical(buf, allocator, inst, .or_),
         .eor_reg => try buildLogical(buf, allocator, inst, .xor_),
         .bic_reg => try buildBic(buf, allocator, inst),
+        .bics_reg => try buildBics(buf, allocator, inst),
         .orn_reg => try buildOrn(buf, allocator, inst),
         .eon_reg => try buildEon(buf, allocator, inst),
 
@@ -230,9 +232,33 @@ fn buildOrn(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
 
 fn buildEon(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.rrr;
-    // EON Xd, Xn, Xm = Xd = Xn ^ ~Xm
     try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .xor_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
+}
+
+fn buildAddSubRegFlags(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+    const need_cmc: u32 = if (tag == .sub_i64) 1 else 0;
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = need_cmc });
+}
+
+fn buildLogicalFlags(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
+    // ANDS: same as AND but sets NZCV (N=bit63, Z=result==0, C=unchanged, V=unchanged)
+    // x86 AND sets SF and ZF, and clears OF and CF. ARM64 ANDS sets N and Z but
+    // preserves C and V (unlike x86 which clears CF). For the MVP, this is close enough —
+    // N and Z match. C and V may differ in edge cases.
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+}
+
+fn buildBics(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // BICS Xd, Xn, Xm = Xd = Xn & ~Xm (with NZCV update)
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .and_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
 }
 
 // ═══════════════════════════════════════════════════════════════════
