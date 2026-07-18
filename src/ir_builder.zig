@@ -20,6 +20,8 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         // ── ALU immediate ─────────────────────────────────────────
         .add_imm => try buildAddSubImm(buf, allocator, inst, .add_i64),
         .sub_imm => try buildAddSubImm(buf, allocator, inst, .sub_i64),
+        .adds_imm => try buildAddSubImmFlags(buf, allocator, inst, .add_i64),
+        .subs_imm => try buildAddSubImmFlags(buf, allocator, inst, .sub_i64),
 
         // ── Move wide immediate ──────────────────────────────────
         .movz => try buildMovz(buf, allocator, inst),
@@ -124,6 +126,19 @@ fn buildAddSubImm(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, t
         .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = 0x1F,
         .flags = 0, .imm = imm,
     });
+}
+
+fn buildAddSubImmFlags(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
+    // ADDS/SUBS — same as ADD/SUB but also sets NZCV
+    const ops = inst.operands.rri12;
+    const imm: u32 = @as(u32, ops.imm12) << (@as(u5, ops.shift) * 12);
+    try buf.append(allocator, .{
+        .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = 0x1F,
+        .flags = 0, .imm = imm,
+    });
+    // imm=1 → CMC needed (SUB-based); imm=0 → no CMC (ADD-based)
+    const need_cmc: u32 = if (tag == .sub_i64) 1 else 0;
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = need_cmc });
 }
 
 // ═══════════════════════════════════════════════════════════════════

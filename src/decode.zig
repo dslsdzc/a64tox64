@@ -12,7 +12,9 @@ const assert = std.debug.assert;
 pub const Opcode = enum(u16) {
     // Data processing — immediate
     add_imm,
+    adds_imm,
     sub_imm,
+    subs_imm,
     movz,
     movk,
     movn,
@@ -229,10 +231,10 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0xFF800000, .value = 0x51000000, .opcode = .sub_imm },  // SUB (immediate, 32-bit)
     .{ .mask = 0xFF800000, .value = 0x91000000, .opcode = .add_imm },  // ADD (immediate, 64-bit)
     .{ .mask = 0xFF800000, .value = 0xD1000000, .opcode = .sub_imm },  // SUB (immediate, 64-bit)
-    .{ .mask = 0xFF800000, .value = 0x31000000, .opcode = .add_imm },  // ADDS (immediate, 32-bit)
-    .{ .mask = 0xFF800000, .value = 0x71000000, .opcode = .sub_imm },  // SUBS (immediate, 32-bit)
-    .{ .mask = 0xFF800000, .value = 0xB1000000, .opcode = .add_imm },  // ADDS (immediate, 64-bit)
-    .{ .mask = 0xFF800000, .value = 0xF1000000, .opcode = .sub_imm },  // SUBS (immediate, 64-bit)
+    .{ .mask = 0xFF800000, .value = 0x31000000, .opcode = .adds_imm },  // ADDS (immediate, 32-bit)
+    .{ .mask = 0xFF800000, .value = 0x71000000, .opcode = .subs_imm },  // SUBS (immediate, 32-bit)
+    .{ .mask = 0xFF800000, .value = 0xB1000000, .opcode = .adds_imm },  // ADDS (immediate, 64-bit)
+    .{ .mask = 0xFF800000, .value = 0xF1000000, .opcode = .subs_imm },  // SUBS (immediate, 64-bit)
     .{ .mask = 0xFF800000, .value = 0x12800000, .opcode = .movn },     // MOVN (32-bit)
     .{ .mask = 0xFF800000, .value = 0x92800000, .opcode = .movn },     // MOVN (64-bit)
     .{ .mask = 0xFF800000, .value = 0x52800000, .opcode = .movz },     // MOVZ (32-bit)
