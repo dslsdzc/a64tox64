@@ -23,7 +23,9 @@ pub const Opcode = enum(u16) {
 
     // Data processing — register
     add_reg,
+    adc_reg,
     sub_reg,
+    sbc_reg,
     add_ext,
     sub_ext,
     mul,
@@ -247,8 +249,12 @@ const opcode_table = [_]OpcodeEntry{
     // ── Data processing — register ──────────────────────────────
     .{ .mask = 0x7FE00000, .value = 0x0B000000, .opcode = .add_reg },  // ADD (register, 32-bit)
     .{ .mask = 0x7FE00000, .value = 0x8B000000, .opcode = .add_reg },  // ADD (register, 64-bit)
+    .{ .mask = 0x7FE00000, .value = 0x1A000000, .opcode = .adc_reg },  // ADC (register, 32-bit)
+    .{ .mask = 0x7FE00000, .value = 0x9A000000, .opcode = .adc_reg },  // ADC (register, 64-bit)
     .{ .mask = 0x7FE00000, .value = 0x4B000000, .opcode = .sub_reg },  // SUB (register, 32-bit)
     .{ .mask = 0x7FE00000, .value = 0xCB000000, .opcode = .sub_reg },  // SUB (register, 64-bit)
+    .{ .mask = 0x7FE00000, .value = 0x5A000000, .opcode = .sbc_reg },  // SBC (register, 32-bit)
+    .{ .mask = 0x7FE00000, .value = 0xDA000000, .opcode = .sbc_reg },  // SBC (register, 64-bit)
     .{ .mask = 0x7FE00000, .value = 0x2B000000, .opcode = .add_ext },  // ADD (extend, 32-bit)
     .{ .mask = 0x7FE00000, .value = 0xAB000000, .opcode = .add_ext },  // ADD (extend, 64-bit)
     .{ .mask = 0x7FE00000, .value = 0x6B000000, .opcode = .sub_ext },  // SUB (extend, 32-bit)
@@ -355,7 +361,7 @@ fn extractOperands(raw: u32, opcode: Opcode) Operands {
         .add_imm, .sub_imm => extractRRI12(raw),
         .movz, .movk, .movn => extractMovImm(raw),
         .adr, .adrp => extractADR(raw),
-        .add_reg, .sub_reg => extractRRR(raw),
+        .add_reg, .adc_reg, .sub_reg, .sbc_reg => extractRRR(raw),
         .add_ext, .sub_ext => extractExtend(raw),
         .and_reg, .bic_reg, .orr_reg, .orn_reg, .eor_reg, .eon_reg => extractRRRShift(raw),
         .mul, .mneg, .sdiv, .udiv => extractRRR(raw),

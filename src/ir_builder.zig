@@ -33,7 +33,9 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
 
         // ── ALU register ─────────────────────────────────────────
         .add_reg => try buildAddSubReg(buf, allocator, inst, .add_i64),
+        .adc_reg => try buildAddSubReg(buf, allocator, inst, .adc_i64),
         .sub_reg => try buildAddSubReg(buf, allocator, inst, .sub_i64),
+        .sbc_reg => try buildAddSubReg(buf, allocator, inst, .sbc_i64),
         .add_ext => try buildAddSubReg(buf, allocator, inst, .add_i64),
         .sub_ext => try buildAddSubReg(buf, allocator, inst, .sub_i64),
         .and_reg => try buildLogical(buf, allocator, inst, .and_),
@@ -660,6 +662,20 @@ test "LDR with register offset → IR" {
     // For now just test the decode works
     const inst = Decode.decode(0xF8606820); // LDR X0, [X1, X2]
     _ = inst;
+}
+
+test "ADC SBC decode and emit" {
+    // ADC X0, X1, X2 (32-bit)
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    const inst_adc = Decode.decode(0x1A020020);
+    try std.testing.expectEqual(Opcode.adc_reg, inst_adc.opcode);
+    // SBC X0, X1, X2 (64-bit)
+    const inst_sbc = Decode.decode(0xDA020020);
+    try std.testing.expectEqual(Opcode.sbc_reg, inst_sbc.opcode);
+    // ADC (64-bit)
+    const inst_adc64 = Decode.decode(0x9A020020);
+    try std.testing.expectEqual(Opcode.adc_reg, inst_adc64.opcode);
 }
 
 test "NOP → IR" {

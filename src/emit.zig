@@ -218,6 +218,39 @@ fn emitSub(ctx: *EmitContext, op: IROp) void {
     }
 }
 
+fn emitAddCarry(ctx: *EmitContext, op: IROp) void {
+    // ADC: dst = src0 + src1 + CF (same as ADD but with carry-in)
+    // x86 opcode: 11 /r (instead of ADD's 01 /r)
+    const dst = mapReg(ctx.regmap, op.dest);
+    const src0 = mapReg(ctx.regmap, op.src0);
+    if (op.src1 != 0x1F) {
+        const src1 = mapReg(ctx.regmap, op.src1);
+        threeOp(ctx, dst, src0, 0x11, 0x13);
+        ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
+        ctx.byte(0x11);
+        ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
+    }
+}
+
+fn emitSubBorrow(ctx: *EmitContext, op: IROp) void {
+    // ARM64 SBC: Xd = Xn - Xm - !C
+    // x86 SBB:   dst = dst - src - CF
+    //
+    // After CMC in nzcv_update, x86 CF = ARM64 C (both = "no borrow").
+    // ARM64 SBC needs borrow = !C, x86 SBB uses CF (= C after CMC).
+    // Invert CF before SBB: CMC → CF = !C → SBB subtracts !C = ✓
+    const dst = mapReg(ctx.regmap, op.dest);
+    const src0 = mapReg(ctx.regmap, op.src0);
+    if (op.src1 != 0x1F) {
+        const src1 = mapReg(ctx.regmap, op.src1);
+        ctx.byte(0xF5); // CMC: CF = !C (invert back for borrow semantics)
+        threeOp(ctx, dst, src0, 0x19, 0x1B);
+        ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
+        ctx.byte(0x19);
+        ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
+    }
+}
+
 fn emitMul(ctx: *EmitContext, op: IROp) void {
     const dst = mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
@@ -551,7 +584,9 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
     const start = ctx.offset;
     switch (op.tag) {
         .add_i64 => emitAdd(ctx, op),
+        .adc_i64 => emitAddCarry(ctx, op),
         .sub_i64 => emitSub(ctx, op),
+        .sbc_i64 => emitSubBorrow(ctx, op),
         .mul_i64 => emitMul(ctx, op),
         .div_u64, .div_s64 => emitDiv(ctx, op, op.tag == .div_s64),
         .and_ => emitLogical(ctx, op, 0x21, 0x23),

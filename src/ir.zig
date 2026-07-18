@@ -47,6 +47,8 @@ pub const Tag = enum(u16) {
     div_u64,
     div_s64,
     mov_i64, // reg-reg copy
+    adc_i64, // add with carry
+    sbc_i64, // subtract with carry
     lshl_i64_imm,
     lshr_i64_imm,
     ashr_i64_imm,
