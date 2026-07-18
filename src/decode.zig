@@ -32,6 +32,8 @@ pub const Opcode = enum(u16) {
     sub_ext,
     mul,
     mneg,
+    madd,
+    msub,
     and_reg,
     ands_reg,
     bic_reg,
@@ -300,11 +302,15 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0x7FE00000, .value = 0xCA000000, .opcode = .eor_reg },  // EOR (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x4A200000, .opcode = .eon_reg },  // EON (32-bit)
     .{ .mask = 0x7FE00000, .value = 0xCA200000, .opcode = .eon_reg },  // EON (64-bit)
-    // MUL/MNEG/MADD/MSUB (bits 15-10 = Ra field)
-    .{ .mask = 0x7FE0FE00, .value = 0x1B007C00, .opcode = .mul },      // MUL (32-bit, Ra=31, ov=0)
-    .{ .mask = 0x7FE0FE00, .value = 0x9B007C00, .opcode = .mul },      // MUL (64-bit, Ra=31, ov=0)
-    .{ .mask = 0x7FE0FE00, .value = 0x1B00FC00, .opcode = .mneg },     // MNEG (32-bit, Ra=31, ov=1)
-    .{ .mask = 0x7FE0FE00, .value = 0x9B00FC00, .opcode = .mneg },     // MNEG (64-bit, Ra=31, ov=1)
+    // MUL/MNEG (bits 15-10 = Ra field, 11111x = Ra=31)
+    // Note: mask includes bit 31 (sf) to distinguish 32/64-bit
+    .{ .mask = 0xFFE0FE00, .value = 0x0B007C00, .opcode = .mul },      // MUL (32-bit, Ra=31, ov=0)
+    .{ .mask = 0xFFE0FE00, .value = 0x9B007C00, .opcode = .mul },      // MUL (64-bit, Ra=31, ov=0)
+    .{ .mask = 0xFFE0FE00, .value = 0x0B00FC00, .opcode = .mneg },     // MNEG (32-bit, Ra=31, ov=1)
+    .{ .mask = 0xFFE0FE00, .value = 0x9B00FC00, .opcode = .mneg },     // MNEG (64-bit, Ra=31, ov=1)
+    // MADD/MSUB (3-source, Ra != 31, bits 10-15 != 11111x)
+    .{ .mask = 0xFF000000, .value = 0x1B000000, .opcode = .madd },     // MADD (32-bit)
+    .{ .mask = 0xFF000000, .value = 0x9B000000, .opcode = .madd },     // MADD (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x1AC00C00, .opcode = .sdiv },     // SDIV (32-bit)
     .{ .mask = 0x7FE00000, .value = 0x9AC00C00, .opcode = .sdiv },     // SDIV (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x1AC00800, .opcode = .udiv },     // UDIV (32-bit)
@@ -407,7 +413,7 @@ fn extractOperands(raw: u32, opcode: Opcode) Operands {
         .add_reg, .adds_reg, .adc_reg, .sub_reg, .subs_reg, .sbc_reg => extractRRR(raw),
         .add_ext, .sub_ext => extractExtend(raw),
         .and_reg, .ands_reg, .bic_reg, .bics_reg, .orr_reg, .orn_reg, .eor_reg, .eon_reg => extractRRRShift(raw),
-        .mul, .mneg, .sdiv, .udiv => extractRRR(raw),
+        .mul, .mneg, .madd, .msub, .sdiv, .udiv => extractRRR(raw),
         .clz => extractRRR(raw),
         .lsl_reg, .lsr_reg, .asr_reg, .ror_reg => extractRRR(raw),
         .cmp_reg, .cmn_reg, .neg_reg => extractCmp(raw),

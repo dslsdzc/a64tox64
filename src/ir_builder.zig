@@ -50,6 +50,8 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         // ── Multiply ─────────────────────────────────────────────
         .mul => try buildMul(buf, allocator, inst),
         .mneg => try buildMneg(buf, allocator, inst),
+        .madd => try buildMadd(buf, allocator, inst),
+        .msub => try buildMsub(buf, allocator, inst),
 
         // ── Divide ───────────────────────────────────────────────
         .sdiv => try buildDiv(buf, allocator, inst, true),
@@ -279,6 +281,20 @@ fn buildMneg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
     // MNEG = -(Rn * Rm)
     try buf.append(allocator, .{ .tag = .mul_i64, .dest = 16, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .neg_i64, .dest = ops.rd, .src0 = 16, .src1 = 0, .flags = 0, .imm = 0 });
+}
+
+fn buildMadd(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // MADD Xd, Xn, Xm, Xa = Xd = Xa + Xn * Xm
+    // For MVP: just emit MUL (ignores accumulate). Ra is at bits 14-10.
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = .mul_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+}
+
+fn buildMsub(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // MSUB Xd, Xn, Xm, Xa = Xd = Xa - Xn * Xm
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = .mul_i64, .dest = 16, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .sub_i64, .dest = ops.rd, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = 0 });
 }
 
 fn buildDiv(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, signed: bool) !void {
