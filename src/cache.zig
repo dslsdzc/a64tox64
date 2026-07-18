@@ -32,13 +32,12 @@ pub const CodeCache = struct {
     }
 
     pub fn insert(cache: *CodeCache, block: *TranslationBlock) !void {
-        block.generation = cache.generation;
         try cache.map.put(block.guest_pc, block);
     }
 
     pub fn allocateBlock(cache: *CodeCache) !*TranslationBlock {
         const block = try cache.allocator.create(TranslationBlock);
-        block.* = TranslationBlock.init(0, &.{}, &.{});
+        block.* = TranslationBlock.init(0, &.{});
         return block;
     }
 
@@ -78,7 +77,7 @@ test "CodeCache lookup after insert" {
     defer cache.deinit();
 
     const block = try cache.allocateBlock();
-    block.* = TranslationBlock.init(0x1000, &.{}, &.{});
+    block.* = TranslationBlock.init(0x1000, &.{});
     try cache.insert(block);
 
     try std.testing.expect(cache.lookup(0x1000) != null);
@@ -90,7 +89,7 @@ test "CodeCache invalidate" {
     defer cache.deinit();
 
     const b1 = try cache.allocateBlock();
-    b1.* = TranslationBlock.init(0x1050, &.{}, &.{});
+    b1.* = TranslationBlock.init(0x1050, &.{});
     try cache.insert(b1);
 
     cache.invalidatePage(0x1000);

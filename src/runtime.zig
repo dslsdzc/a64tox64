@@ -122,9 +122,22 @@ pub const JitRuntime = struct {
         var pc = guest_pc;
         var count: u32 = 0;
         var ends_with_svc = false;
+        var last_opcode: Decode.Opcode = .unknown;
+        var last_target: u64 = 0;
         while (count < MAX_BLOCK_INSTRS) {
             const raw = runtime.readGuestU32(pc);
             const decoded = Decode.decode(raw);
+            // Track last opcode and branch target for chain detection
+            last_opcode = decoded.opcode;
+            if (decoded.opcode == .b or decoded.opcode == .bl) {
+                // B/BL: imm26 at bits 25-0, sign-extended << 2
+                const imm26: i64 = @as(i64, @as(i26, @bitCast(@as(u26, @truncate(raw & 0x03FFFFFF)))));
+                last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm26 << 2)));
+            } else if (decoded.opcode == .b_cond) {
+                // B.cond: imm19 at bits 23-5, sign-extended << 2
+                const imm19: i64 = @as(i64, @as(i19, @bitCast(@as(u19, @truncate((raw >> 5) & 0x7FFFF)))));
+                last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm19 << 2)));
+            }
             try IrB.build(&ir_buf, runtime.allocator, decoded, pc);
             count += 1;
             pc += 4;
@@ -135,7 +148,16 @@ pub const JitRuntime = struct {
         const cpage = try runtime.cache.allocateCodePage(csize);
         const emitted = Emit.emitBlock(cpage, &Emit.DefaultMapping, ir_buf.ops.items);
         const tb = try runtime.cache.allocateBlock();
-        tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len], try runtime.allocator.dupe(IROp, ir_buf.ops.items));
+        tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
+        // Set chain info based on last opcode
+        tb.chain_type = switch (last_opcode) {
+            .b => .direct,
+            .b_cond => .cond,
+            .bl => .call,
+            else => .none,
+        };
+        tb.chain_target = last_target;
+        tb.fallthrough_pc = pc;
         try runtime.cache.insert(tb);
         runtime.last_block_was_svc = ends_with_svc;
         runtime.last_block_next_pc = pc;
@@ -166,8 +188,14 @@ pub const JitRuntime = struct {
         runtime.state.x[7] = asm volatile ("mov %%r11, %[r]" : [r] "=r" (-> u64));
         runtime.state.x[8] = asm volatile ("mov %%rax, %[r]" : [r] "=r" (-> u64));
 
-        // If block ended with SVC, handle the syscall and continue
+        // Chain to next block for direct branches
+        if (!runtime.last_block_was_svc and block.chain_type == .direct) {
+            runtime.execute(block.chain_target);
+            return;
+        }
+        // SVC or indirect: handle normally
         if (runtime.last_block_was_svc) {
+            // SVC: handle syscall and continue
             runtime.last_block_was_svc = false;
             handleSyscall(runtime);
             runtime.execute(runtime.last_block_next_pc);
