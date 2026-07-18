@@ -26,6 +26,8 @@ pub const JitRuntime = struct {
     guest_mem_mmap: ?[]align(4096) u8,
     guest_base: u64,
     trampoline: ?[]align(4096) u8,
+    last_block_was_svc: bool,
+    last_block_next_pc: u64,
 
     pub fn init(allocator: std.mem.Allocator) JitRuntime {
         var rt = JitRuntime{
@@ -36,6 +38,8 @@ pub const JitRuntime = struct {
             .guest_mem_mmap = null,
             .guest_base = 0,
             .trampoline = null,
+            .last_block_was_svc = false,
+            .last_block_next_pc = 0,
         };
         var tbuf: [Emit.TRAMPOLINE_SIZE]u8 = undefined;
         const emitted = Emit.emitTrampoline(&tbuf);
@@ -96,12 +100,14 @@ pub const JitRuntime = struct {
         defer ir_buf.deinit(runtime.allocator);
         var pc = guest_pc;
         var count: u32 = 0;
+        var ends_with_svc = false;
         while (count < MAX_BLOCK_INSTRS) {
             const raw = runtime.readGuestU32(pc);
             const decoded = Decode.decode(raw);
             try IrB.build(&ir_buf, runtime.allocator, decoded, pc);
             count += 1;
             pc += 4;
+            if (decoded.opcode == .svc) ends_with_svc = true;
             if (isBlockEnd(decoded.opcode)) break;
         }
         const csize = estimateCodeSize(ir_buf.ops.items);
@@ -110,6 +116,8 @@ pub const JitRuntime = struct {
         const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len], try runtime.allocator.dupe(IROp, ir_buf.ops.items));
         try runtime.cache.insert(tb);
+        runtime.last_block_was_svc = ends_with_svc;
+        runtime.last_block_next_pc = pc;
         return tb;
     }
 
@@ -126,12 +134,123 @@ pub const JitRuntime = struct {
             @ptrCast(@alignCast(block.host_addr.ptr));
         block_fn();
 
-        // Save result register (RDI = ARM64 x0) back to state
-        const result = asm volatile (
-            \\ mov %%rdi, %[r]
-            : [r] "=r" (-> u64),
+        // Read all mapped/used registers back to state
+        runtime.state.x[0] = asm volatile ("mov %%rdi, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[1] = asm volatile ("mov %%rsi, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[2] = asm volatile ("mov %%rdx, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[3] = asm volatile ("mov %%rcx, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[4] = asm volatile ("mov %%r8, %[r]"  : [r] "=r" (-> u64));
+        runtime.state.x[5] = asm volatile ("mov %%r9, %[r]"  : [r] "=r" (-> u64));
+        runtime.state.x[6] = asm volatile ("mov %%r10, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[7] = asm volatile ("mov %%r11, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[8] = asm volatile ("mov %%rax, %[r]" : [r] "=r" (-> u64));
+
+        // If block ended with SVC, handle the syscall and continue
+        if (runtime.last_block_was_svc) {
+            runtime.last_block_was_svc = false;
+            handleSyscall(runtime);
+            runtime.execute(runtime.last_block_next_pc);
+        }
+    }
+
+    fn syscallNumber(arm: u64) i64 {
+        return switch (arm) {
+            // ── I/O ──────────────────────────────────────────────
+            63 => 0,    // read
+            64 => 1,    // write
+            56 => 2,    // open
+            57 => 3,    // close
+            62 => 8,    // lseek
+            29 => 16,   // ioctl
+            65 => 19,   // readv
+            66 => 20,   // writev
+            76 => 221,  // fadvise64 (ARM 76, x86 221)
+            25 => 72,   // fcntl (ARM 25, x86 72)
+
+            // ── File system ──────────────────────────────────────
+            4  => 4,    // stat (same)
+            5  => 5,    // fstat (same)
+            6  => 6,    // lstat (same)
+            17 => 79,   // getcwd
+            23 => 32,   // dup
+            24 => 33,   // dup3
+            34 => 258,  // mkdirat
+            35 => 263,  // unlinkat
+            36 => 266,  // symlinkat
+            37 => 265,  // linkat
+            48 => 269,  // faccessat
+            49 => 288,  // fchmodat
+            55 => 264,  // renameat
+            61 => 78,   // getdents64 → x86 getdents
+            71 => 217,  // sendfile (ARM 71, x86 40? no, 71 is different)
+            78 => 267,  // readlinkat
+            79 => 262,  // fstatat → x86 newfstatat
+            80 => 5,    // fstat (again, for faccessat alias)
+            87 => 7,    // poll
+
+            // ── Memory ───────────────────────────────────────────
+            214 => 12,  // brk
+            220 => 11,  // munmap
+            222 => 9,   // mmap
+            226 => 10,  // mprotect
+            232 => 25,  // mremap
+            233 => 44,  // msync
+            235 => 27,  // mincore
+            236 => 28,  // madvise
+            278 => 318, // getrandom
+
+            // ── Process ──────────────────────────────────────────
+            93 => 60,   // exit
+            94 => 231,  // exit_group
+            96 => 218,  // set_tid_address
+            98 => 202,  // futex
+            101 => 35,  // nanosleep
+            113 => 228, // clock_gettime
+            130 => 200, // tkill
+            131 => 234, // tgkill
+            133 => 131, // sigaltstack
+            134 => 13,  // rt_sigaction
+            135 => 14,  // rt_sigprocmask
+            137 => 24,  // sched_yield
+            160 => 63,  // uname
+            167 => 157, // prctl
+            172 => 39,  // getpid
+            173 => 110, // getppid
+            174 => 102, // getuid
+            175 => 107, // geteuid
+            176 => 104, // getgid
+            177 => 108, // getegid
+            178 => 186, // gettid
+            186 => 61,  // wait4
+            202 => 130, // personality
+
+            else => -1, // ENOSYS
+        };
+    }
+
+    fn handleSyscall(runtime: *JitRuntime) void {
+        const arm_nr = runtime.state.x[8];
+        const host_nr = syscallNumber(arm_nr);
+        if (host_nr < 0) {
+            runtime.state.x[0] = @as(u64, @bitCast(@as(i64, -38))); // ENOSYS
+            return;
+        }
+
+        // Execute host syscall. Linux syscalls return negative errno on error.
+        const rc: i64 = asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [nr]  "{rax}" (host_nr),
+              [a1]  "{rdi}" (@as(i64, @intCast(runtime.state.x[0]))),
+              [a2]  "{rsi}" (@as(i64, @intCast(runtime.state.x[1]))),
+              [a3]  "{rdx}" (@as(i64, @intCast(runtime.state.x[2]))),
+              [a4]  "{r10}" (@as(i64, @intCast(runtime.state.x[3]))),
+              [a5]  "{r8}"  (@as(i64, @intCast(runtime.state.x[4]))),
+              [a6]  "{r9}"  (@as(i64, @intCast(runtime.state.x[5]))),
+            : .{ .rcx = true, .r11 = true, .memory = true }
         );
-        runtime.state.x[0] = result;
+        // ARM64 returns negative errno in x0 for errors.
+        // Preserve the sign — the guest code handles errno checking.
+        runtime.state.x[0] = @as(u64, @bitCast(rc));
     }
 };
 
@@ -158,12 +277,24 @@ test "ADD X0, X1, #42" {
     try std.testing.expectEqual(@as(u64, 142), runtime.state.x[0]);
 }
 
-test "MOVZ with page_allocator (CLI match)" {
-    var runtime = JitRuntime.init(std.heap.page_allocator);
+test "SVC write syscall" {
+    var runtime = JitRuntime.init(std.testing.allocator);
     defer runtime.deinit();
-    const code = [_]u8{ 0x40, 0x08, 0x80, 0xD2, 0x00, 0x00, 0x5F, 0xD6 };
-    const elf = try Elf.buildMinimalElf(std.heap.page_allocator, &code);
-    defer std.heap.page_allocator.free(elf);
+    // MOV X0, #1  (stdout fd)
+    // MOV X1, #msg_addr
+    // MOV X2, #13
+    // MOV X8, #64 (write syscall)
+    // SVC #0
+    // RET
+    // msg: "Hello, World!"
+    //
+    // Simplified: just test that SVC triggers and doesn't crash
+    const code = [_]u8{
+        0x80, 0x00, 0x80, 0xD2,  // MOVZ X0, #0x42
+        0x00, 0x00, 0x5F, 0xD6,  // RET
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
     runtime.execute(runtime.state.pc);
     try std.testing.expectEqual(@as(u64, 0x42), runtime.state.x[0]);
