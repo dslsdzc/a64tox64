@@ -423,6 +423,23 @@ pub const JitRuntime = struct {
     }
 };
 
+test "resolvePltEntries handles empty libs" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.resolvePltEntries(); // should not crash with no libs
+}
+
+test "resolveLibrary on static ELF (no .dynamic)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{ 0x00, 0x00, 0x5F, 0xD6 };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    // Ensure loaded_libs is empty (static ELF has no .dynamic)
+    try std.testing.expectEqual(@as(usize, 0), runtime.loaded_libs.items.len);
+}
+
 test "MOVZ X0, #0x42" {
     var runtime = JitRuntime.init(std.testing.allocator);
     defer runtime.deinit();
