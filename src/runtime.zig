@@ -63,6 +63,8 @@ pub const JitRuntime = struct {
         if (runtime.guest_mem_mmap) |m| std.posix.munmap(m);
         for (runtime.loaded_libs.items) |*lib| {
             runtime.allocator.free(lib.guest_mem);
+            for (lib.needed.items) |n| runtime.allocator.free(n);
+            lib.needed.deinit(runtime.allocator);
         }
         runtime.loaded_libs.deinit(runtime.allocator);
     }
@@ -317,8 +319,17 @@ pub const JitRuntime = struct {
             needed.deinit(runtime.allocator);
         }
 
-        var next_base: u64 = 0x200000;
-        for (needed.items) |lib_name| {
+        _ = try loadLibsRecursive(runtime, needed.items, 0x200000);
+
+        // Resolve cross-library symbols
+        for (runtime.loaded_libs.items) |*lib| {
+            Elf.resolveLibrary(lib, runtime.loaded_libs.items, elf_bytes);
+        }
+    }
+
+    fn loadLibsRecursive(runtime: *JitRuntime, names: []const []const u8, base: u64) !u64 {
+        var next_base = base;
+        for (names) |lib_name| {
             var already = false;
             for (runtime.loaded_libs.items) |li| {
                 if (std.mem.eql(u8, li.name, lib_name)) { already = true; break; }
@@ -328,11 +339,10 @@ pub const JitRuntime = struct {
             const paths = [_][]const u8{ "./", "/lib/", "/usr/lib/", "/usr/local/lib/" };
             for (paths) |dir| {
                 var full: [4096]u8 = undefined;
-                const pfx = dir;
-                if (pfx.len + lib_name.len > full.len) continue;
-                @memcpy(full[0..pfx.len], pfx);
-                @memcpy(full[pfx.len..][0..lib_name.len], lib_name);
-                full[pfx.len + lib_name.len] = 0;
+                if (dir.len + lib_name.len > full.len) continue;
+                @memcpy(full[0..dir.len], dir);
+                @memcpy(full[dir.len..][0..lib_name.len], lib_name);
+                full[dir.len + lib_name.len] = 0;
 
                 const full_ptr: [*:0]u8 = @ptrCast(&full);
                 const fd = std.os.linux.open(full_ptr, .{ .ACCMODE = .RDONLY }, 0);
@@ -348,14 +358,15 @@ pub const JitRuntime = struct {
                 const dyn_lib = try Elf.loadDynLib(runtime.allocator, mm, lib_name, next_base);
                 std.posix.munmap(mm);
                 next_base += dyn_lib.guest_size;
+
+                // Recursively load this library's dependencies
+                next_base = try loadLibsRecursive(runtime, dyn_lib.needed.items, next_base);
+
                 try runtime.loaded_libs.append(runtime.allocator, dyn_lib);
                 break;
             }
         }
-
-        for (runtime.loaded_libs.items) |*lib| {
-            Elf.resolveLibrary(lib, runtime.loaded_libs.items, elf_bytes);
-        }
+        return next_base;
     }
 };
 

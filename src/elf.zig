@@ -271,6 +271,10 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
         result.fini_arraysz = d.fini_arraysz;
     }
 
+    // Extract DT_NEEDED library names
+    const needed_names = try getNeededLibs(elf_bytes, e_phoff, e_phnum, allocator);
+    result.needed = needed_names;
+
     return result;
 }
 
