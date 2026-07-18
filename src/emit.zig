@@ -683,6 +683,9 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
 
 pub fn emitBlock(buf: []u8, regmap: *const RegisterMap, ops: []const IROp) []u8 {
     var ctx = EmitContext.init(buf, regmap);
+    // Prologue: mov r14, imm64 (slot at offset 2-9, patched at translation)
+    ctx.byte(0x49); ctx.byte(0xBE);
+    ctx.bytes(&[8]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
     for (ops) |op| _ = emitOp(&ctx, op);
     if (ctx.offset == 0) emitRet(&ctx);
     return buf[0..ctx.offset];

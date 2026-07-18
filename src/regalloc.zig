@@ -81,6 +81,36 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         const tmp = sorted[i]; sorted[i] = sorted[best]; sorted[best] = tmp;
     }
 
+    // If x29 is used but not hinted (not mapped in predecessor), force-map it.
+    // x29 (frame pointer) must have a dedicated host register to avoid spill
+    // conflicts with other null-mapped registers (R11 temp) across blocks.
+    if (score[29] > 0 and mapping[29] == null) {
+        for (host_regs, 0..) |reg, idx| {
+            if (idx >= 8 and idx < 12) { // callee-saved slots
+                const h = @intFromEnum(reg);
+                if (!used_hosts[h]) {
+                    mapping[29] = reg;
+                    used_hosts[h] = true;
+                    hint_arm[29] = true;
+                    break;
+                }
+            }
+        }
+        if (mapping[29] == null) {
+            for (host_regs, 0..) |reg, idx| {
+                if (idx < 8) { // call-clobbered
+                    const h = @intFromEnum(reg);
+                    if (!used_hosts[h]) {
+                        mapping[29] = reg;
+                        used_hosts[h] = true;
+                        hint_arm[29] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // Assign non-hinted ARM regs via frequency
     var used: usize = 0;
     var callee_used: usize = 0;

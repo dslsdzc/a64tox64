@@ -170,9 +170,19 @@ pub const JitRuntime = struct {
         const csize = estimateCodeSize(ir_buf.ops.items);
         const cpage = try runtime.cache.allocateCodePage(csize);
 
-        // Using fixed DefaultMapping for all blocks to ensure consistent
-        // register mapping across block boundaries (critical for x29/FP chain).
-        const regmap = Emit.DefaultMapping; // consumed
+        // Per-block register allocation with hotness and predecessor hints.
+        // State-loading prologue ensures consistent cross-block values.
+        const hotness: f32 = if (runtime.last_block_pc > guest_pc) 2.0 else 1.0;
+        const maybe_hints: ?RegAlloc.RegHints = if (runtime.has_pending_hints) h: {
+            break :h RegAlloc.RegHints{
+                .pref = runtime.pending_hints_pref,
+                .scores = runtime.pending_hints_scores,
+            };
+        } else null;
+        const regmap = RegAlloc.allocateAdv(ir_buf.ops.items, hotness,
+            if (maybe_hints) |*h| h else null);
+        runtime.has_pending_hints = false;
+        runtime.last_block_pc = 0; // consumed
 
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
 const tb = try runtime.cache.allocateBlock();
