@@ -83,14 +83,11 @@ pub const JitRuntime = struct {
         runtime.guest_mem_mmap = guest_page;
         runtime.state.pc = loaded.entry;
 
-        // Check if dynamic linking is needed: try to parse .dynamic
+        // Handle dynamic linking if present
         const e_phoff = std.mem.readInt(u64, elf_bytes[32..40], .little);
         const e_phnum = std.mem.readInt(u16, elf_bytes[56..58], .little);
-        const dyn = Elf.parseDynamic(elf_bytes, e_phoff, e_phnum);
-        if (dyn) |d| {
-            // This ELF has a .dynamic section — treat as dynamically linked.
-            // For now, we apply RELATIVE relocations directly in place.
-            _ = d; // Future: load DT_NEEDED libs, resolve symbols
+        if (Elf.parseDynamic(elf_bytes, e_phoff, e_phnum) != null) {
+            try loadDynamicLibs(runtime, elf_bytes, e_phoff, e_phnum);
         }
     }
 
@@ -311,6 +308,54 @@ pub const JitRuntime = struct {
         // ARM64 returns negative errno in x0 for errors.
         // Preserve the sign — the guest code handles errno checking.
         runtime.state.x[0] = @as(u64, @bitCast(rc));
+    }
+
+    fn loadDynamicLibs(runtime: *JitRuntime, elf_bytes: []const u8, e_phoff: u64, e_phnum: u16) !void {
+        var needed = try Elf.getNeededLibs(elf_bytes, e_phoff, e_phnum, runtime.allocator);
+        defer {
+            for (needed.items) |n| runtime.allocator.free(n);
+            needed.deinit(runtime.allocator);
+        }
+
+        var next_base: u64 = 0x200000;
+        for (needed.items) |lib_name| {
+            var already = false;
+            for (runtime.loaded_libs.items) |li| {
+                if (std.mem.eql(u8, li.name, lib_name)) { already = true; break; }
+            }
+            if (already) continue;
+
+            const paths = [_][]const u8{ "./", "/lib/", "/usr/lib/", "/usr/local/lib/" };
+            for (paths) |dir| {
+                var full: [4096]u8 = undefined;
+                const pfx = dir;
+                if (pfx.len + lib_name.len > full.len) continue;
+                @memcpy(full[0..pfx.len], pfx);
+                @memcpy(full[pfx.len..][0..lib_name.len], lib_name);
+                full[pfx.len + lib_name.len] = 0;
+
+                const full_ptr: [*:0]u8 = @ptrCast(&full);
+                const fd = std.os.linux.open(full_ptr, .{ .ACCMODE = .RDONLY }, 0);
+                if (fd > std.math.maxInt(i32)) continue;
+                const fdi: i32 = @intCast(fd);
+                const fsize = std.os.linux.lseek(fdi, 0, std.os.linux.SEEK.END);
+                if (fsize == 0) { _ = std.os.linux.close(fdi); continue; }
+                _ = std.os.linux.lseek(fdi, 0, std.os.linux.SEEK.SET);
+
+                const mm = std.posix.mmap(null, fsize, std.posix.PROT{ .READ = true }, std.posix.MAP{ .TYPE = .PRIVATE }, fdi, 0) catch { _ = std.os.linux.close(fdi); continue; };
+                _ = std.os.linux.close(fdi);
+
+                const dyn_lib = try Elf.loadDynLib(runtime.allocator, mm, lib_name, next_base);
+                std.posix.munmap(mm);
+                next_base += dyn_lib.guest_size;
+                try runtime.loaded_libs.append(runtime.allocator, dyn_lib);
+                break;
+            }
+        }
+
+        for (runtime.loaded_libs.items) |*lib| {
+            Elf.resolveLibrary(lib, runtime.loaded_libs.items, elf_bytes);
+        }
     }
 };
 
