@@ -181,7 +181,6 @@ pub const DynLib = struct {
     guest_base: u64,
     guest_size: u64,
     entry: u64,
-    // Dynamic info (guest vaddr, not file offset)
     symtab: u64,
     strtab: u64,
     strsz: u64,
@@ -192,6 +191,11 @@ pub const DynLib = struct {
     fini: u64,
     fini_array: u64,
     fini_arraysz: u64,
+    // Relocation info (guest vaddr)
+    rela: u64,
+    relasz: u64,
+    jmprel: u64,
+    pltrelsz: u64,
 };
 
 /// Load a dynamic library into guest memory and parse its metadata.
@@ -257,9 +261,17 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
         .fini = 0,
         .fini_array = 0,
         .fini_arraysz = 0,
+        .rela = 0,
+        .relasz = 0,
+        .jmprel = 0,
+        .pltrelsz = 0,
     };
 
     if (dyn2) |d| {
+        result.rela = if (d.rela != 0) load_base + d.rela else 0;
+        result.relasz = d.relasz;
+        result.jmprel = if (d.jmprel != 0) load_base + d.jmprel else 0;
+        result.pltrelsz = d.pltrelsz;
         result.symtab = if (d.symtab != 0) load_base + d.symtab else 0;
         result.strtab = if (d.strtab != 0) load_base + d.strtab else 0;
         result.strsz = d.strsz;
@@ -469,7 +481,7 @@ pub fn getNeededLibs(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, allocato
 }
 
 /// Get the name of a symbol by its index.
-fn getSymbolName(guest: []const u8, base: u64, symtab: u64, strtab: u64, sym_idx: u64) ?[]const u8 {
+pub fn getSymbolName(guest: []const u8, base: u64, symtab: u64, strtab: u64, sym_idx: u64) ?[]const u8 {
     if (sym_idx == 0 or symtab == 0 or strtab == 0) return null;
     const sym_guest = symtab + sym_idx * @sizeOf(Elf64Sym);
     if (sym_guest < base) return null;

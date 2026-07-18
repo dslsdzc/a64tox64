@@ -325,6 +325,9 @@ pub const JitRuntime = struct {
         for (runtime.loaded_libs.items) |*lib| {
             Elf.resolveLibrary(lib, runtime.loaded_libs.items, elf_bytes);
         }
+
+        // JIT-translate PLT entries so GOT points to x86-64 code
+        try resolvePltEntries(runtime);
     }
 
     fn loadLibsRecursive(runtime: *JitRuntime, names: []const []const u8, base: u64) !u64 {
@@ -367,6 +370,56 @@ pub const JitRuntime = struct {
             }
         }
         return next_base;
+    }
+
+    fn resolvePltEntries(runtime: *JitRuntime) !void {
+        for (runtime.loaded_libs.items) |lib| {
+            if (lib.symtab == 0 or lib.strtab == 0) continue;
+            if (lib.jmprel == 0 or lib.pltrelsz == 0) continue;
+
+            const guest = lib.guest_mem;
+            const base = lib.guest_base;
+            const num_plt = @as(usize, @intCast(lib.pltrelsz / @sizeOf(Elf.Elf64Rela)));
+
+            var idx: usize = 0;
+            while (idx < num_plt) : (idx += 1) {
+                const rela_guest = lib.jmprel + idx * @sizeOf(Elf.Elf64Rela);
+                if (rela_guest < base) continue;
+                const roff = rela_guest - base;
+                if (roff + @sizeOf(Elf.Elf64Rela) > guest.len) continue;
+
+                const r_offset = std.mem.readInt(u64, guest[@intCast(roff)..][0..8], .little);
+                const r_info = std.mem.readInt(u64, guest[@intCast(roff + 8)..][0..8], .little);
+                const r_addend = std.mem.readInt(i64, guest[@intCast(roff + 16)..][0..8], .little);
+                if (Elf.r_type(r_info) != Elf.R_AARCH64_JUMP_SLOT) continue;
+
+                const sym_idx = Elf.r_sym(r_info);
+                const sym_name = Elf.getSymbolName(guest, base, lib.symtab, lib.strtab, sym_idx) orelse continue;
+                const sym_val = Elf.findGlobalSymbol(runtime.loaded_libs.items, sym_name) orelse continue;
+
+                // JIT-translate the ARM64 code at sym_val
+                const saved_mem = runtime.guest_mem;
+                const saved_base = runtime.guest_base;
+                runtime.guest_mem = lib.guest_mem;
+                runtime.guest_base = lib.guest_base;
+
+                const block = runtime.translateBlock(sym_val) catch {
+                    runtime.guest_mem = saved_mem;
+                    runtime.guest_base = saved_base;
+                    continue;
+                };
+
+                runtime.guest_mem = saved_mem;
+                runtime.guest_base = saved_base;
+
+                // Patch GOT entry to point to translated x86-64 code
+                const got_off = r_offset - base;
+                if (got_off + 8 <= guest.len) {
+                    const x86_addr = @intFromPtr(block.host_addr.ptr);
+                    std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], x86_addr + @as(u64, @bitCast(r_addend)), .little);
+                }
+            }
+        }
     }
 };
 
