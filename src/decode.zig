@@ -107,6 +107,10 @@ pub const Opcode = enum(u16) {
     dmb,
     dsb,
     isb,
+    extr,
+    smulh,
+    umulh,
+    hint,
     // Unknown / unallocated
     unknown,
 };
@@ -227,12 +231,22 @@ fn decodeOpcode(raw: u32) Opcode {
     // Exception generation (SVC)
     if ((raw & 0xFF000000) == 0xD4000000) return .svc;
 
-    // NOP (hint encoding)
+    // NOP/HINT (all hint encodings: HINT #0-N)
+    if ((raw & 0xFFFFF000) == 0xD5032000) return .hint;
     if (raw == 0xD503201F) return .nop;
 
-    // TBZ/TBNZ (bit 31 varies with bit number, can't use static table)
+    // TBZ/TBNZ
     if ((raw & 0x7E000000) == 0x36000000) return .tbz;
     if ((raw & 0x7E000000) == 0x37000000) return .tbnz;
+
+    // LDPSW (bit 31+30 = 10, vs LDP 32-bit = 00)
+    if ((raw & 0xFFC00000) == 0xAA000000) return .ldpsw;  // signed offset
+    if ((raw & 0xFFC00000) == 0xAA800000) return .ldpsw;  // pre-index
+    if ((raw & 0xFFC00000) == 0xAA400000) return .ldpsw;  // post-index
+
+    // SMULH/UMULH (3-source group with Ra=31, bits 23-22 = 10/11)
+    if ((raw & 0xFFE00000) == 0x9B400000 and (raw & 0x0000FC00) == 0x00007C00) return .smulh;
+    if ((raw & 0xFFE00000) == 0x9BC00000 and (raw & 0x0000FC00) == 0x00007C00) return .umulh;
 
     // Main dispatch by bit pattern table
     inline for (&opcode_table) |entry| {
@@ -311,6 +325,8 @@ const opcode_table = [_]OpcodeEntry{
     // MADD/MSUB (3-source, Ra != 31, bits 10-15 != 11111x)
     .{ .mask = 0xFF000000, .value = 0x1B000000, .opcode = .madd },     // MADD (32-bit)
     .{ .mask = 0xFF000000, .value = 0x9B000000, .opcode = .madd },     // MADD (64-bit)
+    // SMULH/UMULH: handled via fast path in decodeOpcode (Rm overlaps opcode bits)
+    // LDPSW: handled via fast path (bit 31 needed to disambiguate from LDP 32-bit)
     .{ .mask = 0x7FE00000, .value = 0x1AC00C00, .opcode = .sdiv },     // SDIV (32-bit)
     .{ .mask = 0x7FE00000, .value = 0x9AC00C00, .opcode = .sdiv },     // SDIV (64-bit)
     .{ .mask = 0x7FE00000, .value = 0x1AC00800, .opcode = .udiv },     // UDIV (32-bit)
@@ -413,7 +429,8 @@ fn extractOperands(raw: u32, opcode: Opcode) Operands {
         .add_reg, .adds_reg, .adc_reg, .sub_reg, .subs_reg, .sbc_reg => extractRRR(raw),
         .add_ext, .sub_ext => extractExtend(raw),
         .and_reg, .ands_reg, .bic_reg, .bics_reg, .orr_reg, .orn_reg, .eor_reg, .eon_reg => extractRRRShift(raw),
-        .mul, .mneg, .madd, .msub, .sdiv, .udiv => extractRRR(raw),
+        .mul, .mneg, .madd, .msub, .smulh, .umulh, .sdiv, .udiv => extractRRR(raw),
+        .ldpsw => extractLDP_STP(raw),
         .clz => extractRRR(raw),
         .lsl_reg, .lsr_reg, .asr_reg, .ror_reg => extractRRR(raw),
         .cmp_reg, .cmn_reg, .neg_reg => extractCmp(raw),

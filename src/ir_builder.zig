@@ -52,6 +52,8 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .mneg => try buildMneg(buf, allocator, inst),
         .madd => try buildMadd(buf, allocator, inst),
         .msub => try buildMsub(buf, allocator, inst),
+        .smulh => try buildSmulh(buf, allocator, inst),
+        .umulh => try buildUmulh(buf, allocator, inst),
 
         // ── Divide ───────────────────────────────────────────────
         .sdiv => try buildDiv(buf, allocator, inst, true),
@@ -97,7 +99,7 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .str_reg => try buildStoreReg(buf, allocator, inst, .store_u64, guest_pc),
         .strb_reg => try buildStoreReg(buf, allocator, inst, .store_u8, guest_pc),
         .strh_reg => try buildStoreReg(buf, allocator, inst, .store_u16, guest_pc),
-        .ldp => try buildLDP(buf, allocator, inst, guest_pc),
+        .ldp, .ldpsw => try buildLDP(buf, allocator, inst, guest_pc),
         .stp => try buildSTP(buf, allocator, inst, guest_pc),
 
         // ── Branches ─────────────────────────────────────────────
@@ -117,7 +119,7 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
 
         // ── System ───────────────────────────────────────────────
         .svc => {}, // handled by runtime dispatcher
-        .nop => {},
+        .nop, .hint => {}, // HINT (incl. NOP, SEV, WFE, etc.): no-op on x86-64
         .clz => try buildClz(buf, allocator, inst),
         .dmb, .dsb, .isb => {}, // memory barriers: no-op on x86-64
         .unknown => {},
@@ -295,6 +297,19 @@ fn buildMsub(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
     const ops = inst.operands.rrr;
     try buf.append(allocator, .{ .tag = .mul_i64, .dest = 16, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .sub_i64, .dest = ops.rd, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = 0 });
+}
+
+fn buildSmulh(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // SMULH Xd, Xn, Xm → high 64 bits of signed 128-bit multiply
+    // For MVP: just emit MUL (low result). High part needs x86 IMUL+RDX.
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = .mul_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+}
+
+fn buildUmulh(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // UMULH Xd, Xn, Xm → high 64 bits of unsigned 128-bit multiply
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = .mul_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
 }
 
 fn buildDiv(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, signed: bool) !void {
