@@ -54,6 +54,7 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .msub => try buildMsub(buf, allocator, inst),
         .smulh => try buildSmulh(buf, allocator, inst),
         .umulh => try buildUmulh(buf, allocator, inst),
+        .extr => try buildExtr(buf, allocator, inst),
 
         // ── Divide ───────────────────────────────────────────────
         .sdiv => try buildDiv(buf, allocator, inst, true),
@@ -340,6 +341,21 @@ fn buildShift(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: 
         .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm,
         .flags = 0, .imm = 0,
     });
+}
+
+fn buildExtr(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // EXTR Xd, Xn, Xm, #s = (Xn >> s) | (Xm << (size-s))
+    // Decompose into: lsr + lsl + or
+    const ops = inst.operands.rrr;
+    const s: u32 = (inst.raw >> 16) & 0x3F; // immr = bits 21-16
+    const size: u64 = if (inst.sf) 64 else 32;
+    const left: u32 = @truncate(size - s);
+    // lsr X16, Xn, s
+    try buf.append(allocator, .{ .tag = .lshr_i64_imm, .dest = 16, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = s });
+    // lsl X17, Xm, left
+    try buf.append(allocator, .{ .tag = .lshl_i64_imm, .dest = 17, .src0 = ops.rm, .src1 = 0x1F, .flags = 0, .imm = left });
+    // or Rd, X16, X17
+    try buf.append(allocator, .{ .tag = .or_, .dest = ops.rd, .src0 = 16, .src1 = 17, .flags = 0, .imm = 0 });
 }
 
 // ═══════════════════════════════════════════════════════════════════

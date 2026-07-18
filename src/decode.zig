@@ -248,6 +248,9 @@ fn decodeOpcode(raw: u32) Opcode {
     if ((raw & 0xFFE00000) == 0x9B400000 and (raw & 0x0000FC00) == 0x00007C00) return .smulh;
     if ((raw & 0xFFE00000) == 0x9BC00000 and (raw & 0x0000FC00) == 0x00007C00) return .umulh;
 
+    // EXTR (extract register): bits 30-24 = 00|10011, bit 22 = 0
+    if ((raw & 0x7F400000) == 0x13000000) return .extr;
+
     // Main dispatch by bit pattern table
     inline for (&opcode_table) |entry| {
         if ((raw & entry.mask) == entry.value) {
@@ -429,7 +432,7 @@ fn extractOperands(raw: u32, opcode: Opcode) Operands {
         .add_reg, .adds_reg, .adc_reg, .sub_reg, .subs_reg, .sbc_reg => extractRRR(raw),
         .add_ext, .sub_ext => extractExtend(raw),
         .and_reg, .ands_reg, .bic_reg, .bics_reg, .orr_reg, .orn_reg, .eor_reg, .eon_reg => extractRRRShift(raw),
-        .mul, .mneg, .madd, .msub, .smulh, .umulh, .sdiv, .udiv => extractRRR(raw),
+        .mul, .mneg, .madd, .msub, .smulh, .umulh, .sdiv, .udiv, .extr => extractRRR(raw),
         .ldpsw => extractLDP_STP(raw),
         .clz => extractRRR(raw),
         .lsl_reg, .lsr_reg, .asr_reg, .ror_reg => extractRRR(raw),
