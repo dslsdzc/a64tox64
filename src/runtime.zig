@@ -267,9 +267,7 @@ const tb = try runtime.cache.allocateBlock();
         var cap_r15: u64 = undefined;
         const guest_sp = runtime.state.sp;
         asm volatile (
-                        \\ mov %[sp], %%r15
-            \\ mov %[fp], %%r11
-            \\ call *%%r11
+                        \\ call *%%r11
             \\ movq %%rdi, %[v_rdi]
             \\ movq %%rsi, %[v_rsi]
             \\ movq %%rdx, %[v_rdx]
@@ -300,8 +298,23 @@ const tb = try runtime.cache.allocateBlock();
               [v_r13] "=m" (cap_r13),
               [v_r14] "=m" (cap_r14),
               [v_r15] "=m" (cap_r15),
-            : [fp] "r" (block_fn),
-              [sp] "r" (guest_sp),
+            : [fp] "{r11}" (block_fn),
+              [sp] "{r15}" (guest_sp),
+              // Load guest state: {reg} constraints set each register before asm
+              [s0] "{rdi}" (runtime.state.x[0]),
+              [s1] "{rsi}" (runtime.state.x[1]),
+              [s2] "{rdx}" (runtime.state.x[2]),
+              [s3] "{rcx}" (runtime.state.x[3]),
+              [s4] "{r8}"  (runtime.state.x[4]),
+              [s5] "{r9}"  (runtime.state.x[5]),
+              [s6] "{r10}" (runtime.state.x[6]),
+              [s8] "{rax}" (runtime.state.x[8]),
+              [s9] "{rbx}" (runtime.state.x[9]),
+              [s10] "{rbp}" (runtime.state.x[10]),
+              [s11] "{r12}" (runtime.state.x[11]),
+              [s12] "{r13}" (runtime.state.x[12]),
+              [s13] "{r14}" (runtime.state.x[13]),
+              [s14] "{r15}" (runtime.state.x[14]),
             : .{ .rax = true, .r11 = true, .r15 = true, .memory = true }
         );
 
