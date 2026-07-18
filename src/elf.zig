@@ -205,13 +205,16 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
     const raw = try loadElf(allocator, elf_bytes);
     defer allocator.free(raw.guest_mem);
 
-    // ET_DYN (shared object) uses vaddr relative to base = 0.
-    // ET_EXEC uses absolute vaddr. For .so files loaded at runtime,
-    // we relocate them to next_base.
+    // The .so file has segments at vaddr = raw.guest_base + offset.
+    // At load_base, the same segments should be at load_base + offset.
+    // We allocate guest_mem to cover load_base..load_base+raw.guest_base+raw.guest_size
+    // and place raw data at offset raw.guest_base from the start.
     const load_base = next_base;
-    const guest_mem = try allocator.alloc(u8, raw.guest_size);
+    const guest_pad = raw.guest_base; // bytes before first segment
+    const guest_size = guest_pad + raw.guest_size;
+    const guest_mem = try allocator.alloc(u8, @intCast(guest_size));
     @memset(guest_mem, 0);
-    @memcpy(guest_mem[0..raw.guest_mem.len], raw.guest_mem);
+    @memcpy(guest_mem[@intCast(guest_pad)..][0..raw.guest_mem.len], raw.guest_mem);
 
     // Apply R_AARCH64_RELATIVE: add load_base to original base = 0
     var fix_count: usize = 0;
@@ -228,10 +231,12 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
                     const r_info = std.mem.readInt(u64, elf_bytes[@intCast(rela_fileoff + 8)..][0..8], .little);
                     const r_addend = std.mem.readInt(i64, elf_bytes[@intCast(rela_fileoff + 16)..][0..8], .little);
                     if (r_type(r_info) == R_AARCH64_RELATIVE) {
-                        const target_off = r_offset;
-                        if (target_off + 8 <= guest_mem.len) {
+                        // r_offset is a vaddr relative to the original base (0 for .so).
+                        // In guest_mem, data is at offset raw.guest_base from start.
+                        // So the GOT entry is at r_offset in guest_mem.
+                        if (r_offset + 8 <= guest_mem.len) {
                             const value = load_base + @as(u64, @bitCast(r_addend));
-                            std.mem.writeInt(u64, guest_mem[@intCast(target_off)..][0..8], value, .little);
+                            std.mem.writeInt(u64, guest_mem[@intCast(r_offset)..][0..8], value, .little);
                             fix_count += 1;
                         }
                     }
@@ -249,7 +254,7 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
         .name = name,
         .guest_mem = guest_mem,
         .guest_base = load_base,
-        .guest_size = raw.guest_size,
+        .guest_size = guest_size,
         .entry = raw.entry + load_base, // .so entry is relative to base
         .symtab = 0,
         .strtab = 0,
