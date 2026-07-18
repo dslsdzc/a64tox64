@@ -83,6 +83,10 @@ pub const Opcode = enum(u16) {
     br,
     blr,
     ret_,
+    cbz,
+    cbnz,
+    tbz,
+    tbnz,
 
     // Conditional
     b_cond,
@@ -165,6 +169,8 @@ pub const Operands = union(enum) {
     b_target: struct { label: i64 },
     br_target: struct { rn: u5 },
     bcond: struct { label: i64, cond: Condition },
+    cbz: struct { rt: u5, label: i64 },
+    tbz: struct { rt: u5, bit: u6, label: i64 },
     csel: struct { rd: u5, rn: u5, rm: u5, cond: Condition },
     ccmp: struct { rn: u5, rm: u5, cond: Condition, nzcv: u4 },
     svc_op: struct { imm16: u16 },
@@ -217,6 +223,10 @@ fn decodeOpcode(raw: u32) Opcode {
 
     // NOP (hint encoding)
     if (raw == 0xD503201F) return .nop;
+
+    // TBZ/TBNZ (bit 31 varies with bit number, can't use static table)
+    if ((raw & 0x7E000000) == 0x36000000) return .tbz;
+    if ((raw & 0x7E000000) == 0x37000000) return .tbnz;
 
     // Main dispatch by bit pattern table
     inline for (&opcode_table) |entry| {
@@ -345,16 +355,18 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0xFF000000, .value = 0x98000000, .opcode = .ldr_literal },
     // PRFM (literal) — skip
     // LDP/STP
-    .{ .mask = 0x7FC00000, .value = 0x29400000, .opcode = .ldp },      // LDP (32-bit, signed offset)
-    .{ .mask = 0x7FC00000, .value = 0xA9400000, .opcode = .ldp },      // LDP (64-bit, signed offset)
-    .{ .mask = 0x7FC00000, .value = 0x29800000, .opcode = .stp },      // STP (32-bit, signed offset)
-    .{ .mask = 0x7FC00000, .value = 0xA9800000, .opcode = .stp },      // STP (64-bit, signed offset)
-    .{ .mask = 0x7FC00000, .value = 0x28400000, .opcode = .ldp },      // LDP (32-bit, pre-index)
-    .{ .mask = 0x7FC00000, .value = 0xA8400000, .opcode = .ldp },      // LDP (64-bit, pre-index)
+    .{ .mask = 0x7FC00000, .value = 0x2A000000, .opcode = .ldp },      // LDP (32-bit, signed offset)
+    .{ .mask = 0x7FC00000, .value = 0x6A000000, .opcode = .ldp },      // LDP (64-bit, signed offset)
+    .{ .mask = 0x7FC00000, .value = 0x28000000, .opcode = .stp },      // STP (32-bit, signed offset)
+    .{ .mask = 0x7FC00000, .value = 0x68000000, .opcode = .stp },      // STP (64-bit, signed offset)
+    .{ .mask = 0x7FC00000, .value = 0x2A800000, .opcode = .ldp },      // LDP (32-bit, pre-index)
+    .{ .mask = 0x7FC00000, .value = 0x6A800000, .opcode = .ldp },      // LDP (64-bit, pre-index)
     .{ .mask = 0x7FC00000, .value = 0x28800000, .opcode = .stp },      // STP (32-bit, pre-index)
-    .{ .mask = 0x7FC00000, .value = 0xA8800000, .opcode = .stp },      // STP (64-bit, pre-index)
-    .{ .mask = 0x7FC00000, .value = 0x28400000, .opcode = .ldp },      // LDP (32-bit, post-index)
-    .{ .mask = 0x7FC00000, .value = 0xA8400000, .opcode = .ldp },      // LDP (64-bit, post-index)
+    .{ .mask = 0x7FC00000, .value = 0x68800000, .opcode = .stp },      // STP (64-bit, pre-index)
+    .{ .mask = 0x7FC00000, .value = 0x2A400000, .opcode = .ldp },      // LDP (32-bit, post-index)
+    .{ .mask = 0x7FC00000, .value = 0x6A400000, .opcode = .ldp },      // LDP (64-bit, post-index)
+    .{ .mask = 0x7FC00000, .value = 0x28400000, .opcode = .stp },      // STP (32-bit, post-index)
+    .{ .mask = 0x7FC00000, .value = 0x68400000, .opcode = .stp },      // STP (64-bit, post-index)
     // LDUR/STUR
     .{ .mask = 0x3B200000, .value = 0x38400000, .opcode = .ldurb },    // LDURB
     .{ .mask = 0x3B200000, .value = 0x78400000, .opcode = .ldurh },    // LDURH
@@ -365,6 +377,11 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0xFFFFFC1F, .value = 0xD61F0000, .opcode = .br },
     .{ .mask = 0xFFFFFC1F, .value = 0xD63F0000, .opcode = .blr },
     .{ .mask = 0xFFFFFC1F, .value = 0xD65F0000, .opcode = .ret_ },
+    // ── Compare & branch ───────────────────────────────────────
+    .{ .mask = 0x7F000000, .value = 0x34000000, .opcode = .cbz },   // CBZ (32-bit)
+    .{ .mask = 0x7F000000, .value = 0xB4000000, .opcode = .cbz },   // CBZ (64-bit)
+    .{ .mask = 0x7F000000, .value = 0x35000000, .opcode = .cbnz },  // CBNZ (32-bit)
+    .{ .mask = 0x7F000000, .value = 0xB5000000, .opcode = .cbnz },  // CBNZ (64-bit)
 };
 
 // ── Operand extraction ────────────────────────────────────────────
@@ -391,6 +408,8 @@ fn extractOperands(raw: u32, opcode: Opcode) Operands {
         .b, .bl => extractBranch(raw),
         .br, .blr, .ret_ => extractBranchReg(raw),
         .b_cond => extractBCond(raw),
+        .cbz, .cbnz => extractCBZ(raw),
+        .tbz, .tbnz => extractTBZ(raw),
         .svc => extractSVC(raw),
         .nop => Operands{ .none = {} },
         else => Operands{ .none = {} },
@@ -546,6 +565,23 @@ fn extractBCond(raw: u32) Operands {
     const cond: u4 = @truncate(raw & 0xF);
     const offset: i64 = @as(i64, @as(i21, @bitCast(@as(u21, @intCast(imm19 << 2)))));
     return .{ .bcond = .{ .label = offset, .cond = @enumFromInt(cond) } };
+}
+
+fn extractCBZ(raw: u32) Operands {
+    const rt: u5 = @truncate(raw & 0x1F);
+    const imm19: u19 = @truncate((raw >> 5) & 0x7FFFF);
+    const offset: i64 = @as(i64, @as(i21, @bitCast(@as(u21, @intCast(imm19 << 2)))));
+    return .{ .cbz = .{ .rt = rt, .label = offset } };
+}
+
+fn extractTBZ(raw: u32) Operands {
+    const rt: u5 = @truncate(raw & 0x1F);
+    const imm14: u14 = @truncate((raw >> 5) & 0x3FFF);
+    const b40: u5 = @truncate((raw >> 19) & 0x1F);
+    const b5: u1 = @truncate(raw >> 31);
+    const bit: u6 = (@as(u6, b5) << 5) | b40;
+    const offset: i64 = @as(i64, @as(i16, @bitCast(@as(u16, @intCast(imm14 << 2)))));
+    return .{ .tbz = .{ .rt = rt, .bit = bit, .label = offset } };
 }
 
 fn extractSVC(raw: u32) Operands {

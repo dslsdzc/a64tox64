@@ -107,6 +107,8 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
 
         // ── Conditional branch ───────────────────────────────────
         .b_cond => try buildBCond(buf, allocator, inst, guest_pc),
+        .cbz, .cbnz => try buildCBZ(buf, allocator, inst, guest_pc),
+        .tbz, .tbnz => try buildTBZ(buf, allocator, inst, guest_pc),
 
         // ── Conditional compare ──────────────────────────────────
         .ccmp_reg, .ccmp_imm => try buildCCmp(buf, allocator, inst),
@@ -583,6 +585,29 @@ fn buildBCond(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest
     const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + inst.operands.bcond.label));
     try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .br_cond, .dest = 0, .src0 = 0, .src1 = 0, .flags = @intFromEnum(inst.operands.bcond.cond), .imm = @truncate(target) });
+}
+
+fn buildCBZ(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
+    const ops = inst.operands.cbz;
+    const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + ops.label));
+    const is_cbnz = inst.opcode == .cbnz;
+    // CBZ/CBNZ = CMP Xt, XZR + B.EQ/B.NE
+    try buf.append(allocator, .{ .tag = .sub_i64, .dest = 0x1F, .src0 = ops.rt, .src1 = 0x1F, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 1 }); // CMC
+    try buf.append(allocator, .{ .tag = .br_cond, .dest = 0, .src0 = 0, .src1 = 0, .flags = if (is_cbnz) @as(u16, @intFromEnum(Decode.Condition.ne)) else @as(u16, @intFromEnum(Decode.Condition.eq)), .imm = @truncate(target) });
+}
+
+fn buildTBZ(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
+    const ops = inst.operands.tbz;
+    const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + ops.label));
+    const is_tbnz = inst.opcode == .tbnz;
+    // TBZ/TBNZ = test bit and branch
+    // LSR X16, Xt, #bit; AND X16, X16, #1; CMP X16, XZR; B.EQ/B.NE
+    try buf.append(allocator, .{ .tag = .lshr_i64_imm, .dest = 16, .src0 = ops.rt, .src1 = 0x1F, .flags = 0, .imm = ops.bit });
+    try buf.append(allocator, .{ .tag = .and_, .dest = 16, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = 1 });
+    try buf.append(allocator, .{ .tag = .sub_i64, .dest = 0x1F, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 1 }); // CMC
+    try buf.append(allocator, .{ .tag = .br_cond, .dest = 0, .src0 = 0, .src1 = 0, .flags = if (is_tbnz) @as(u16, @intFromEnum(Decode.Condition.ne)) else @as(u16, @intFromEnum(Decode.Condition.eq)), .imm = @truncate(target) });
 }
 
 fn buildCCmp(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
