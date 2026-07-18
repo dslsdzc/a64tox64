@@ -28,6 +28,7 @@ pub const JitRuntime = struct {
     trampoline: ?[]align(4096) u8,
     last_block_was_svc: bool,
     last_block_next_pc: u64,
+    loaded_libs: std.ArrayListUnmanaged(Elf.DynLib) = .{ .items = &.{}, .capacity = 0 },
 
     pub fn init(allocator: std.mem.Allocator) JitRuntime {
         var rt = JitRuntime{
@@ -40,6 +41,7 @@ pub const JitRuntime = struct {
             .trampoline = null,
             .last_block_was_svc = false,
             .last_block_next_pc = 0,
+            .loaded_libs = .{ .items = &.{}, .capacity = 0 },
         };
         var tbuf: [Emit.TRAMPOLINE_SIZE]u8 = undefined;
         const emitted = Emit.emitTrampoline(&tbuf);
@@ -59,6 +61,10 @@ pub const JitRuntime = struct {
         runtime.cache.deinit();
         if (runtime.trampoline) |t| std.posix.munmap(t);
         if (runtime.guest_mem_mmap) |m| std.posix.munmap(m);
+        for (runtime.loaded_libs.items) |*lib| {
+            runtime.allocator.free(lib.guest_mem);
+        }
+        runtime.loaded_libs.deinit(runtime.allocator);
     }
 
     pub fn loadElf(runtime: *JitRuntime, elf_bytes: []const u8) !void {
@@ -76,6 +82,16 @@ pub const JitRuntime = struct {
         runtime.guest_mem = guest_page[0..loaded.guest_mem.len];
         runtime.guest_mem_mmap = guest_page;
         runtime.state.pc = loaded.entry;
+
+        // Check if dynamic linking is needed: try to parse .dynamic
+        const e_phoff = std.mem.readInt(u64, elf_bytes[32..40], .little);
+        const e_phnum = std.mem.readInt(u16, elf_bytes[56..58], .little);
+        const dyn = Elf.parseDynamic(elf_bytes, e_phoff, e_phnum);
+        if (dyn) |d| {
+            // This ELF has a .dynamic section — treat as dynamically linked.
+            // For now, we apply RELATIVE relocations directly in place.
+            _ = d; // Future: load DT_NEEDED libs, resolve symbols
+        }
     }
 
     fn readGuestU32(runtime: *JitRuntime, addr: u64) u32 {
