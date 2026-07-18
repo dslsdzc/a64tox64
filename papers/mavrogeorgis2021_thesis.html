@@ -1,0 +1,769 @@
+<!DOCTYPE html><html lang="en">
+<head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<title>[2112.01189] Simplifying heterogeneous migration between x86 and ARM machines</title><meta property="og:description" content="Heterogeneous computing is the strategy of deploying multiple types of processing elements within a single workflow,
+and allowing each to perform the tasks to which is best suited.
+To fully harness the power of heterog…">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Simplifying heterogeneous migration between x86 and ARM machines">
+<meta name="twitter:image:src" content="https://ar5iv.labs.arxiv.org/assets/ar5iv_card.png">
+<meta name="twitter:image:alt" content="ar5iv logo">
+<meta property="og:title" content="Simplifying heterogeneous migration between x86 and ARM machines">
+<meta property="og:site_name" content="ar5iv">
+<meta property="og:image" content="https://ar5iv.labs.arxiv.org/assets/ar5iv_card.png">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ar5iv.labs.arxiv.org/html/2112.01189">
+<link rel="canonical" target="_blank" href="https://ar5iv.labs.arxiv.org/html/2112.01189">
+
+<!--Generated on Fri Mar  1 15:47:28 2024 by LaTeXML (version 0.8.8) http://dlmf.nist.gov/LaTeXML/.-->
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<meta name="keywords" lang="en" content="Heterogeneous Systems,  Migration,  Compilers">
+
+<script>
+  function detectColorScheme(){
+    var theme="light";
+    var current_theme = localStorage.getItem("ar5iv_theme");
+    if(current_theme){
+      if(current_theme == "dark"){
+        theme = "dark";
+      } }
+    else if(!window.matchMedia) { return false; }
+    else if(window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      theme = "dark"; }
+    if (theme=="dark") {
+      document.documentElement.setAttribute("data-theme", "dark");
+    } else {
+      document.documentElement.setAttribute("data-theme", "light"); } }
+
+  detectColorScheme();
+
+  function toggleColorScheme(){
+    var current_theme = localStorage.getItem("ar5iv_theme");
+    if (current_theme) {
+      if (current_theme == "light") {
+        localStorage.setItem("ar5iv_theme", "dark"); }
+      else {
+        localStorage.setItem("ar5iv_theme", "light"); } }
+    else {
+        localStorage.setItem("ar5iv_theme", "dark"); }
+    detectColorScheme(); }
+</script>
+<link media="all" rel="stylesheet" href="/assets/ar5iv-fonts.0.8.4.css"><link media="all" rel="stylesheet" href="/assets/ar5iv.0.8.5.css"><link media="all" rel="stylesheet" href="/assets/ar5iv-site.0.2.2.css">
+</head>
+<body>
+<div class="ltx_page_main">
+<div class="ltx_page_content">
+<article class="ltx_document ltx_authors_1line ltx_leqno">
+<h1 class="ltx_title ltx_title_document">Simplifying heterogeneous migration between x86 and ARM machines</h1>
+<div class="ltx_authors">
+<span class="ltx_creator ltx_role_author">
+<span class="ltx_personname">Nikolaos Mavrogeorgis
+</span><span class="ltx_author_notes">
+<span class="ltx_contact ltx_role_email"><a href="mailto:nikos.mavrogeorgis@ed.ac.uk">nikos.mavrogeorgis@ed.ac.uk</a>
+</span>
+<span class="ltx_contact ltx_role_affiliation"><span id="id1.1.id1" class="ltx_text ltx_affiliation_institution">University of Edinburgh</span>
+</span></span></span>
+</div>
+
+<div class="ltx_abstract">
+<h6 class="ltx_title ltx_title_abstract">Abstract.</h6>
+<p id="id2.id1" class="ltx_p">Heterogeneous computing is the strategy of deploying multiple types of processing elements within a single workflow,
+and allowing each to perform the tasks to which is best suited.
+To fully harness the power of heterogeneity, we want to be able to dynamically schedule portions of the code
+and migrate processes at runtime between the architectures.
+Also, migration includes transforming the execution state of the process,
+which induces a significant overhead that offsets the benefits of
+migrating in the first place.
+The goal of my PhD is to work on techniques that allow applications to run on heterogeneous cores
+under a shared programming model,
+and to tackle the generic problem of creating a uniform address space between processes
+running on these highly diverse systems.
+This would greatly simplify the migration process.
+We will start by examining a common stack layout between x86 and ARM binaries, focusing on these two widely spread
+architectures, and later we will try to generalize to other more diverse execution environments.
+On top of that, the performance and energy efficiency of the above effort compared to current approaches will be benchmarked.
+</p>
+</div>
+<div class="ltx_keywords">Heterogeneous Systems, Migration, Compilers
+</div>
+<span id="id1" class="ltx_note ltx_note_frontmatter ltx_role_ccs"><sup class="ltx_note_mark">†</sup><span class="ltx_note_outer"><span class="ltx_note_content"><sup class="ltx_note_mark">†</sup><span class="ltx_note_type">ccs: </span>Computer systems organization Heterogeneous (hybrid) systems</span></span></span><span id="id2" class="ltx_note ltx_note_frontmatter ltx_role_ccs"><sup class="ltx_note_mark">†</sup><span class="ltx_note_outer"><span class="ltx_note_content"><sup class="ltx_note_mark">†</sup><span class="ltx_note_type">ccs: </span>Software and its engineering Compilers</span></span></span>
+<section id="S1" class="ltx_section">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">1. </span>Introduction</h2>
+
+<div id="S1.p1" class="ltx_para">
+<p id="S1.p1.1" class="ltx_p">In both industry and academia there is the belief that in order to achieve higher performance, energy efficiency
+and lower cost, attention must be given to specialized hardware <cite class="ltx_cite ltx_citemacro_citep">(Jouppi et al<span class="ltx_text">.</span>, <a href="#bib.bib12" title="" class="ltx_ref">2017</a>)</cite>.
+Combining this special-purpose hardware (e.g. GPUs, TPUs, accelerators) with general-purpose hardware (e.g. CPUs),
+and reconfigurable integrated circuits (e.g. FPGAs),
+leads to heterogeneous architectures,
+allowing mixed workloads to be executed in the most suitable hardware <cite class="ltx_cite ltx_citemacro_citep">(AMD, <a href="#bib.bib2" title="" class="ltx_ref">2011</a>)</cite>.
+The different processing units may share the same ISA, like in the big.LITTLE architecture <cite class="ltx_cite ltx_citemacro_citep">(Jeff, <a href="#bib.bib11" title="" class="ltx_ref">2012</a>)</cite>,
+or even employ heterogeneous-ISAs.
+A heterogeneous-ISA approach yields even more diversity to exploit, like different code density, register depth and
+width or decode instruction complexity <cite class="ltx_cite ltx_citemacro_citep">(Venkat and
+Tullsen, <a href="#bib.bib19" title="" class="ltx_ref">2014</a>)</cite>.
+For example, smartNIC and smartSSD processors are increasingly adopted in the data center <cite class="ltx_cite ltx_citemacro_citep">(Le et al<span class="ltx_text">.</span>, <a href="#bib.bib16" title="" class="ltx_ref">2017</a>; Kang
+et al<span class="ltx_text">.</span>, <a href="#bib.bib13" title="" class="ltx_ref">2013</a>)</cite>,
+and they are usually paired with x86 host processors,
+which could lead to large-scale live migration between architectures.</p>
+</div>
+<div id="S1.p2" class="ltx_para">
+<p id="S1.p2.1" class="ltx_p">Whatever the type of heterogeneity supported, a shared memory programming (SMP) model is usually the most convenient solution
+for the programmer.
+Moreover, bus standards like OpenCAPI <cite class="ltx_cite ltx_citemacro_citep">(Consortium, <a href="#bib.bib8" title="" class="ltx_ref">2021</a>)</cite> have emerged, aiming to provide improved coherency and synchronization
+in heterogeneous systems, favoring SMP programming models.
+Therefore, we will focus on the setting of SMP models in heterogeneous-ISA environments.</p>
+</div>
+<div id="S1.p3" class="ltx_para">
+<p id="S1.p3.1" class="ltx_p">An approach like Popcorn <cite class="ltx_cite ltx_citemacro_citep">(Barbalace et al<span class="ltx_text">.</span>, <a href="#bib.bib4" title="" class="ltx_ref">2017</a>)</cite>, allows applications to migrate during runtime at equivalence
+points of computation in the program <cite class="ltx_cite ltx_citemacro_citep">(Lyerly, <a href="#bib.bib18" title="" class="ltx_ref">2016</a>)</cite>, but requires first the stack transformation of the program
+between architectures.
+This creates an overhead to the migration,
+which grows linearly with the number of stack frames, and the number of variables,
+but also poses additional engineering effort for creating the transformation toolchain.
+Also, the above technique generates two fat binaries, with some metadata necessary for migration,
+which are more difficult to deploy in embedded systems.
+In order to harness the power of various heterogeneous techniques, it is necessary to have efficient process migration
+at runtime, otherwise the migration costs will offset the benefits of heterogeneity.
+</p>
+</div>
+<div id="S1.p4" class="ltx_para">
+<p id="S1.p4.1" class="ltx_p">One effective way to exploit heterogeneity would be to circumvent the stack transformation at runtime by imposing a
+uniform stack layout between the target architectures.
+The focus currently is between the x86-64 <cite class="ltx_cite ltx_citemacro_citep">(Devices, <a href="#bib.bib9" title="" class="ltx_ref">2012</a>)</cite> and ARMv8 <cite class="ltx_cite ltx_citemacro_citep">(Limited, <a href="#bib.bib17" title="" class="ltx_ref">2020</a>)</cite> target ISAs. The first fundamental part of this idea, is to keep the Application Binary Interface (ABI) the same between the
+architectures.
+On top of that, we need to explore the effect of various optimizations (target-dependent or not) that affect spills and
+refills in memory.
+To this end, we modify  the LLVM’s backend infrastructure <cite class="ltx_cite ltx_citemacro_citep">(Lattner, <a href="#bib.bib15" title="" class="ltx_ref">2008</a>)</cite>, controlling the emitted
+assembly instructions, and tune the optimization flags accordingly.</p>
+</div>
+<div id="S1.p5" class="ltx_para">
+<p id="S1.p5.1" class="ltx_p">The first difference from existing works like bit.LITTLE, is that we focus on heterogeneous-ISA architectures,
+instead of homogeneous ones.
+In the context of ISA heterogeneity, some of the current approaches require the transformation at runtime of the
+stack from one architecture to another, in order to migrate a thread, like in the case of
+Popcorn software <cite class="ltx_cite ltx_citemacro_citep">(Barbalace et al<span class="ltx_text">.</span>, <a href="#bib.bib5" title="" class="ltx_ref">2015</a>)</cite> or Venkat’s work <cite class="ltx_cite ltx_citemacro_citep">(Bhat et al<span class="ltx_text">.</span>, <a href="#bib.bib6" title="" class="ltx_ref">2016</a>)</cite>.
+We will try to avoid this transformation.
+Ultimately, our goal would be to extend this work to multiple architectures, instead of relying solely on the
+64-bit versions of x86 and ARM, or on other commonly used combinations, as described in Section <a href="#S5" title="5. Related Work ‣ Simplifying heterogeneous migration between x86 and ARM machines" class="ltx_ref"><span class="ltx_text ltx_ref_tag">5</span></a>.</p>
+</div>
+</section>
+<section id="S2" class="ltx_section">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">2. </span>Overview of the proposed work</h2>
+
+<div id="S2.p1" class="ltx_para">
+<p id="S2.p1.1" class="ltx_p">Our initial focus is to find ways to overcome the stack transformation overhead at runtime.
+The way an application interacts with its stack, doing load and store instructions, is determined by various factors,
+such as the ABI, the optimizations done at compile-time and the target-dependent code generation.</p>
+</div>
+<div id="S2.p2" class="ltx_para">
+<p id="S2.p2.1" class="ltx_p">The first step, was to modify LLVM’s backend for the x86-64 and Aarch64 targets.
+First of all, the number of registers available in the architecture (register depth) affects the register
+pressure, i.e. the number of simultaneously live variables at an instruction) and, consequently, the frequency of
+spills and refills in the stack <cite class="ltx_cite ltx_citemacro_citep">(Braun and Hack, <a href="#bib.bib7" title="" class="ltx_ref">2009</a>)</cite>.
+Therefore, we modified the architecture backend, to get the same register depth.
+We have, also, mapped the various registers one-to-one, taking into consideration their occasional target specific functionality,
+e.g. the platform register in ARMv8.
+Moreover, the procedure calling convention dictates the number of registers that will be spilled at the boundary
+of the stack frame as arguments.
+In the same way, it enumerates the callee-saved registers, which will also be saved in the stack frame in case
+they are to be modified.
+Hence, we implemented the same calling conventions for both targets.</p>
+</div>
+<div id="S2.p3" class="ltx_para">
+<p id="S2.p3.1" class="ltx_p">However, even if these differences are completely resolved,
+we still have to observe the dynamic behaviour of the executed application, and its interaction with the stack.
+Ideally, we aim to generalize our solution to other architectures, with different register depths, pointer sizes and
+other architecture specifics.</p>
+</div>
+</section>
+<section id="S3" class="ltx_section">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">3. </span>Preliminary results</h2>
+
+<div id="S3.p1" class="ltx_para">
+<p id="S3.p1.1" class="ltx_p">A main concern is to ensure that forcing some characteristics on an architecture does not impact performance
+a lot during program execution, given that we are missing some architecture-specific optimizations. For instance, we have removed 15 of the general purpose registers (GPRs) of the Aarch64 LLVM target, which had 32 GPRs,
+to match the 17 GPRs of the x86-64 architecture (including the stack pointer).
+So far, we have run experiments only on integer benchmarks, for the C language.
+Also, we focused on compute- and  memory-intensive benchmarks.
+Running the NAS Parallel Benchmarks <cite class="ltx_cite ltx_citemacro_citep">(Bailey et al<span class="ltx_text">.</span>, <a href="#bib.bib3" title="" class="ltx_ref">1991</a>)</cite>, we measure the overhead of removing the registers for Aarch64 and
+show some sample plots for one benchmark in Figure <a href="#S3.F1" title="Figure 1 ‣ 3. Preliminary results ‣ Simplifying heterogeneous migration between x86 and ARM machines" class="ltx_ref"><span class="ltx_text ltx_ref_tag">1</span></a>.
+All in all, we observed no more than 6% of overhead in the <span id="S3.p1.1.1" class="ltx_text ltx_font_italic">-O1</span> flag for the benchmark suite.</p>
+</div>
+<figure id="S3.F1" class="ltx_figure"><img src="/html/2112.01189/assets/plots/sole_remove_15_O1_B_large_font_bt.png" id="S3.F1.g1" class="ltx_graphics ltx_img_landscape" width="287" height="167" alt="Refer to caption">
+<figcaption class="ltx_caption"><span class="ltx_tag ltx_tag_figure">Figure 1. </span>BT results for a modified AArch64 target</figcaption>
+</figure>
+</section>
+<section id="S4" class="ltx_section">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">4. </span>Work to be done</h2>
+
+<div id="S4.p1" class="ltx_para">
+<p id="S4.p1.1" class="ltx_p">Now we will describe the necessary changes to the LLVM backends of the targets.
+Where a register in an architecture does not have a reciprocal to the other architecture (e.g. there is no platform
+register in x86-64), we plan to either emulate the same behaviour, or ignore it if it has no important role  
+to our prototype.</p>
+</div>
+<div id="S4.p2" class="ltx_para">
+<p id="S4.p2.1" class="ltx_p">In addition, there are some fundamental differences between our targets that lead to stack mismatch during execution.
+For example, the x86 architecture is CISC and includes operations between the memory and the registers.
+On the contrary, the ARM architecture is RISC and employs the load-compute-store philosophy,
+which creates additional register pressure, especially now that we have reduced the number of ARMv8 registers to
+match the number of x86-64 registers.
+Therefore, we need to empirically identify stack layout differences at runtime and pinpoint the causes of these
+differences.</p>
+</div>
+<div id="S4.p3" class="ltx_para">
+<p id="S4.p3.1" class="ltx_p">Following the above, we may have to mitigate those differences, either at the intermediate representation (IR) level (e.g. with a flag like
+<span id="S4.p3.1.1" class="ltx_text ltx_font_italic">mem2reg</span>, to reduce unnecessary loads), or at a target-dependent level.
+If tuning the flags is not sufficient, we may again need to modify the code generation of the respective
+backend, to emulate the desired behaviour.</p>
+</div>
+<div id="S4.p4" class="ltx_para">
+<p id="S4.p4.1" class="ltx_p">After this work has matured enough, we will try to generalize our approach by analyzing the fundamental properties
+of an architecture that shape its stack at runtime.
+Consequently, we will examine the feasibility of  an architecture design and/or a specification of a more universal ABI,
+that allows us to expand to more diverse targets, like CPU/DPU systems.
+In order to address architectures with smaller number of registers,
+we may have to emulate some registers by consuming more stack area.</p>
+</div>
+<div id="S4.p5" class="ltx_para">
+<p id="S4.p5.1" class="ltx_p">Finally, we will check experimentally that implementing a similar address space does not lead
+to performance issues, for execution on only one architecture.</p>
+</div>
+</section>
+<section id="S5" class="ltx_section">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">5. </span>Related Work</h2>
+
+<div id="S5.p1" class="ltx_para">
+<p id="S5.p1.1" class="ltx_p">Having a unified address space in heterogeneous environments, is not a new idea.
+AMD started originally the Heterogeneous System Architecture (HSA) framework, supporting a
+single address space accessible to both CPU and GPU, through virtual address translation <cite class="ltx_cite ltx_citemacro_citep">(Kyriazis, <a href="#bib.bib14" title="" class="ltx_ref">2012</a>)</cite>.
+Still, it is the programmer’s responsibility to identify and schedule the workloads statically.
+In the Popcorn compiler toolchain and state transformation runtime <cite class="ltx_cite ltx_citemacro_citep">(Barbalace et al<span class="ltx_text">.</span>, <a href="#bib.bib4" title="" class="ltx_ref">2017</a>)</cite>,
+a separate binary is created for each architecture,
+which is augmented with metadata by the middle- and back-end LLVM passes, necessary for the state transformation.
+When a migration occurs, the runtime converts all function activations from the source ISA format to the destination
+ISA format <cite class="ltx_cite ltx_citemacro_citep">(Lyerly, <a href="#bib.bib18" title="" class="ltx_ref">2016</a>)</cite>.
+In another case, Venkat<cite class="ltx_cite ltx_citemacro_citep">(Venkat and
+Tullsen, <a href="#bib.bib19" title="" class="ltx_ref">2014</a>)</cite> and DeVuyst <cite class="ltx_cite ltx_citemacro_citep">(DeVuyst
+et al<span class="ltx_text">.</span>, <a href="#bib.bib10" title="" class="ltx_ref">2012</a>)</cite> use dynamic binary translation for one fat binary,
+until the binary reaches a migration point and state transformation takes place.
+These last efforts also included smaller register widths, like 32 bits, but we foresee that architectures with at
+least 64 bits will dominate, hence we focus on them for now.</p>
+</div>
+</section>
+<section id="S6" class="ltx_section">
+<h2 class="ltx_title ltx_title_section">
+<span class="ltx_tag ltx_tag_section">6. </span>Conclusion</h2>
+
+<div id="S6.p1" class="ltx_para">
+<p id="S6.p1.1" class="ltx_p">This paper presents the outline of our proposed approach, for simplifying heterogeneous ISA migration.
+Our plan is to come up with solutions that create a uniform address space between the processes,
+whereas eliminating the overhead of state transformation at runtime.
+Preliminary results indicate that enforcing a similar stack layout,
+through an identical ABI between x86-64 and Aarch64 targets,
+does not deteriorate performance significantly, while it paves the way for actually creating identical
+stack layouts.
+An ultimate goal would be to extend this work, in order to ease portability
+of migration to various targets, other than x86-64 and ARMv8.</p>
+</div>
+<div class="ltx_acknowledgements">
+<h6 class="ltx_title ltx_title_acknowledgements">Acknowledgements.</h6>
+The work has been supervised by Dr Antonio Barbalace at the University of Edinburgh.
+The PhD started in 2020 and thesis submission is expected in 2023.
+
+</div>
+</section>
+<section id="bib" class="ltx_bibliography">
+<h2 class="ltx_title ltx_title_bibliography">References</h2>
+
+<ul class="ltx_biblist">
+<li id="bib.bib1" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">(1)</span>
+<span class="ltx_bibblock">        
+
+
+
+
+</span>
+</li>
+<li id="bib.bib2" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">AMD (2011)</span>
+<span class="ltx_bibblock">
+AMD. 2011.
+
+</span>
+<span class="ltx_bibblock">Apu Overview.
+
+</span>
+<span class="ltx_bibblock">(2011), 1 – 2.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib3" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Bailey et al<span id="bib.bib3.2.2.1" class="ltx_text">.</span> (1991)</span>
+<span class="ltx_bibblock">
+D. H. Bailey, E. Barszcz,
+J. T. Barton, D. S. Browning,
+R. L. Carter, L. Dagum,
+R. A. Fatoohi, P. O. Frederickson,
+T. A. Lasinski, R. S. Schreiber,
+H. D. Simon, V. Venkatakrishnan, and
+S. K. Weeratunga. 1991.
+
+</span>
+<span class="ltx_bibblock">The nas parallel benchmarks.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib3.3.1" class="ltx_emph ltx_font_italic">International Journal of High Performance
+Computing Applications</em> 5, 3
+(1991), 63–73.
+
+</span>
+<span class="ltx_bibblock">
+
+<a target="_blank" href="https://doi.org/10.1177/109434209100500306" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://doi.org/10.1177/109434209100500306</a>
+
+</span>
+</li>
+<li id="bib.bib4" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Barbalace et al<span id="bib.bib4.2.2.1" class="ltx_text">.</span> (2017)</span>
+<span class="ltx_bibblock">
+Antonio Barbalace, Robert
+Lyerly, Christopher Jelesnianski, Anthony
+Carno, Ho-Ren Chuang, Vincent Legout,
+and Binoy Ravindran. 2017.
+
+</span>
+<span class="ltx_bibblock">Breaking the boundaries in heterogeneous-ISA
+datacenters.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib4.3.1" class="ltx_emph ltx_font_italic">ACM SIGARCH Computer Architecture News</em>
+45, 1 (2017),
+645–659.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib5" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Barbalace et al<span id="bib.bib5.2.2.1" class="ltx_text">.</span> (2015)</span>
+<span class="ltx_bibblock">
+Antonio Barbalace, Marina
+Sadini, Saif Ansary, Christopher
+Jelesnianski, Akshay Ravichandran, Cagil
+Kendir, Alastair Murray, and Binoy
+Ravindran. 2015.
+
+</span>
+<span class="ltx_bibblock">Popcorn: bridging the programmability gap in
+heterogeneous-ISA platforms. In <em id="bib.bib5.3.1" class="ltx_emph ltx_font_italic">Proceedings of the
+Tenth European Conference on Computer Systems</em>. 1–16.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib6" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Bhat et al<span id="bib.bib6.2.2.1" class="ltx_text">.</span> (2016)</span>
+<span class="ltx_bibblock">
+Sharath K Bhat,
+Ajithchandra Saya, Hemedra K Rawat,
+Antonio Barbalace, and Binoy
+Ravindran. 2016.
+
+</span>
+<span class="ltx_bibblock">Harnessing energy efficiency of heterogeneous-ISA
+platforms.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib6.3.1" class="ltx_emph ltx_font_italic">ACM SIGOPS Operating Systems Review</em>
+49, 2 (2016),
+65–69.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib7" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Braun and Hack (2009)</span>
+<span class="ltx_bibblock">
+Matthias Braun and
+Sebastian Hack. 2009.
+
+</span>
+<span class="ltx_bibblock">Register spilling and live-range splitting for
+ssa-form programs.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib7.1.1" class="ltx_emph ltx_font_italic">Lecture Notes in Computer Science (including
+subseries Lecture Notes in Artificial Intelligence and Lecture Notes in
+Bioinformatics)</em> 5501 LNCS (2009),
+174–189.
+
+</span>
+<span class="ltx_bibblock">
+
+
+<a target="_blank" href="https://doi.org/10.1007/978-3-642-00722-4_13" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://doi.org/10.1007/978-3-642-00722-4_13</a>
+
+</span>
+</li>
+<li id="bib.bib8" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Consortium (2021)</span>
+<span class="ltx_bibblock">
+OpenCAPI Consortium.
+2021.
+
+</span>
+<span class="ltx_bibblock">OpenCAPI Open Interface Architecture.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+<span class="ltx_bibblock">
+<a target="_blank" href="https://opencapi.org/about" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://opencapi.org/about</a>
+
+</span>
+</li>
+<li id="bib.bib9" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Devices (2012)</span>
+<span class="ltx_bibblock">
+Advanced Micro Devices.
+2012.
+
+</span>
+<span class="ltx_bibblock">AMD64 Technology AMD64 Architecture Programmer ’ s
+Manual Volume 4 : 128-Bit and 256-Bit.
+
+</span>
+<span class="ltx_bibblock">4, 26568 (2012).
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib10" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">DeVuyst
+et al<span id="bib.bib10.2.2.1" class="ltx_text">.</span> (2012)</span>
+<span class="ltx_bibblock">
+Matthew DeVuyst, Ashish
+Venkat, and Dean M. Tullsen.
+2012.
+
+</span>
+<span class="ltx_bibblock">Execution Migration in a Heterogeneous-ISA Chip
+Multiprocessor.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib10.3.1" class="ltx_emph ltx_font_italic">SIGPLAN Not.</em> 47,
+4 (March 2012),
+261–272.
+
+</span>
+<span class="ltx_bibblock">
+
+<a target="_blank" href="https://doi.org/10.1145/2248487.2151004" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://doi.org/10.1145/2248487.2151004</a>
+
+</span>
+</li>
+<li id="bib.bib11" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Jeff (2012)</span>
+<span class="ltx_bibblock">
+Brian Jeff.
+2012.
+
+</span>
+<span class="ltx_bibblock">Big. LITTLE system architecture from ARM: saving
+power through heterogeneous multiprocessing and task context migration. In
+<em id="bib.bib11.1.1" class="ltx_emph ltx_font_italic">Proceedings of the 49th Annual Design Automation
+Conference</em>. ACM, 1143–1146.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib12" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Jouppi et al<span id="bib.bib12.2.2.1" class="ltx_text">.</span> (2017)</span>
+<span class="ltx_bibblock">
+Norman P. Jouppi, Cliff
+Young, Nishant Patil, David Patterson,
+Gaurav Agrawal, Raminder Bajwa,
+Sarah Bates, Suresh Bhatia,
+Nan Boden, Al Borchers,
+Rick Boyle, Pierre-luc Cantin,
+Clifford Chao, Chris Clark,
+Jeremy Coriell, Mike Daley,
+Matt Dau, Jeffrey Dean,
+Ben Gelb, Tara Vazir Ghaemmaghami,
+Rajendra Gottipati, William Gulland,
+Robert Hagmann, C. Richard Ho,
+Doug Hogberg, John Hu,
+Robert Hundt, Dan Hurt,
+Julian Ibarz, Aaron Jaffey,
+Alek Jaworski, Alexander Kaplan,
+Harshit Khaitan, Daniel Killebrew,
+Andy Koch, Naveen Kumar,
+Steve Lacy, James Laudon,
+James Law, Diemthu Le,
+Chris Leary, Zhuyuan Liu,
+Kyle Lucke, Alan Lundin,
+Gordon MacKean, Adriana Maggiore,
+Maire Mahony, Kieran Miller,
+Rahul Nagarajan, Ravi Narayanaswami,
+Ray Ni, Kathy Nix,
+Thomas Norrie, Mark Omernick,
+Narayana Penukonda, Andy Phelps,
+Jonathan Ross, Matt Ross,
+Amir Salek, Emad Samadiani,
+Chris Severn, Gregory Sizikov,
+Matthew Snelham, Jed Souter,
+Dan Steinberg, Andy Swing,
+Mercedes Tan, Gregory Thorson,
+Bo Tian, Horia Toma,
+Erick Tuttle, Vijay Vasudevan,
+Richard Walter, Walter Wang,
+Eric Wilcox, and Doe Hyun Yoon.
+2017.
+
+</span>
+<span class="ltx_bibblock">In-Datacenter Performance Analysis of a Tensor
+Processing Unit. In <em id="bib.bib12.3.1" class="ltx_emph ltx_font_italic">Proceedings of the 44th Annual
+International Symposium on Computer Architecture</em> (Toronto, ON, Canada)
+<em id="bib.bib12.4.2" class="ltx_emph ltx_font_italic">(ISCA ’17)</em>. Association for
+Computing Machinery, New York, NY, USA,
+1–12.
+
+</span>
+<span class="ltx_bibblock">
+
+<a target="_blank" href="https://doi.org/10.1145/3079856.3080246" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://doi.org/10.1145/3079856.3080246</a>
+
+</span>
+</li>
+<li id="bib.bib13" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Kang
+et al<span id="bib.bib13.2.2.1" class="ltx_text">.</span> (2013)</span>
+<span class="ltx_bibblock">
+Y. Kang, Y. Kee,
+E. L. Miller, and C. Park.
+2013.
+
+</span>
+<span class="ltx_bibblock">Enabling cost-effective data processing with smart
+SSD. In <em id="bib.bib13.3.1" class="ltx_emph ltx_font_italic">2013 IEEE 29th Symposium on Mass Storage
+Systems and Technologies (MSST)</em>. 1–12.
+
+</span>
+<span class="ltx_bibblock">
+<a target="_blank" href="https://doi.org/10.1109/MSST.2013.6558444" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://doi.org/10.1109/MSST.2013.6558444</a>
+
+</span>
+</li>
+<li id="bib.bib14" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Kyriazis (2012)</span>
+<span class="ltx_bibblock">
+George Kyriazis.
+2012.
+
+</span>
+<span class="ltx_bibblock">Heterogeneous system architecture: A technical
+review.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib14.1.1" class="ltx_emph ltx_font_italic">AMD, Inc</em> (2012),
+1–18.
+
+</span>
+<span class="ltx_bibblock">
+<a target="_blank" href="http://scholar.google.com/scholar?hl=en&amp;btnG=Search&amp;q=intitle:Heterogeneous+System+Architecture+:+A+Technical+Review#0" title="" class="ltx_ref ltx_url ltx_font_typewriter">http://scholar.google.com/scholar?hl=en&amp;btnG=Search&amp;q=intitle:Heterogeneous+System+Architecture+:+A+Technical+Review#0</a>
+
+</span>
+</li>
+<li id="bib.bib15" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Lattner (2008)</span>
+<span class="ltx_bibblock">
+Chris Lattner.
+2008.
+
+</span>
+<span class="ltx_bibblock">Introduction to the llvm compiler system. In
+<em id="bib.bib15.1.1" class="ltx_emph ltx_font_italic">Proceedings of International Workshop on Advanced
+Computing and Analysis Techniques in Physics Research, Erice, Sicily,
+Italy</em>. 19.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib16" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Le et al<span id="bib.bib16.2.2.1" class="ltx_text">.</span> (2017)</span>
+<span class="ltx_bibblock">
+Yanfang Le, Hyunseok
+Chang, Sarit Mukherjee, Limin Wang,
+Aditya Akella, Michael M. Swift, and
+T. V. Lakshman. 2017.
+
+</span>
+<span class="ltx_bibblock">UNO: Uniflying Host and Smart NIC Offload for
+Flexible Packet Processing. In <em id="bib.bib16.3.1" class="ltx_emph ltx_font_italic">Proceedings of the
+2017 Symposium on Cloud Computing</em> (Santa Clara, California)
+<em id="bib.bib16.4.2" class="ltx_emph ltx_font_italic">(SoCC ’17)</em>. Association for
+Computing Machinery, New York, NY, USA,
+506–519.
+
+</span>
+<span class="ltx_bibblock">
+
+<a target="_blank" href="https://doi.org/10.1145/3127479.3132252" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://doi.org/10.1145/3127479.3132252</a>
+
+</span>
+</li>
+<li id="bib.bib17" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Limited (2020)</span>
+<span class="ltx_bibblock">
+Arm Limited.
+2020.
+
+</span>
+<span class="ltx_bibblock">Armv8-A Instruction Set Architecture
+Non-Confidential Proprietary Notice.
+
+</span>
+<span class="ltx_bibblock">1 (2020).
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+<li id="bib.bib18" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Lyerly (2016)</span>
+<span class="ltx_bibblock">
+Robert F. Lyerly.
+2016.
+
+</span>
+<span class="ltx_bibblock"><em id="bib.bib18.1.1" class="ltx_emph ltx_font_italic">Popcorn linux: A compiler and runtime for
+state transformation between heterogeneous-ISA architectures</em>.
+
+</span>
+<span class="ltx_bibblock">
+
+</span>
+</li>
+<li id="bib.bib19" class="ltx_bibitem">
+<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Venkat and
+Tullsen (2014)</span>
+<span class="ltx_bibblock">
+Ashish Venkat and Dean M
+Tullsen. 2014.
+
+</span>
+<span class="ltx_bibblock">Harnessing ISA diversity: Design of a
+heterogeneous-ISA chip multiprocessor. In <em id="bib.bib19.1.1" class="ltx_emph ltx_font_italic">2014
+ACM/IEEE 41st International Symposium on Computer Architecture (ISCA)</em>.
+IEEE, 121–132.
+
+</span>
+<span class="ltx_bibblock">
+</span>
+</li>
+</ul>
+</section>
+</article>
+</div>
+<div class="ar5iv-footer"><a href="/html/2112.01187" class="ar5iv-nav-button ar5iv-nav-button-prev">◄</a>
+    <a class="ar5iv-home-button" href="/"><img height="40" alt="ar5iv homepage" src="/assets/ar5iv.png"></a>
+    <a href="/feeling_lucky" class="ar5iv-text-button">Feeling<br>lucky?</a>
+    <a href="/land_of_honey_and_milk" rel="nofollow" aria-hidden="true" tabindex="-1"></a>
+    <a href="/log/2112.01189" class="ar5iv-text-button ar5iv-severity-warning">Conversion<br>report</a>
+    <a class="ar5iv-text-button" target="_blank" href="https://github.com/dginev/ar5iv/issues/new?template=improve-article--arxiv-id-.md&title=Improve+article+2112.01189">Report<br>an issue</a>
+    <a href="https://arxiv.org/abs/2112.01189" class="ar5iv-text-button arxiv-ui-theme">View&nbsp;original<br>on&nbsp;arXiv</a><a href="/html/2112.01190" class="ar5iv-nav-button ar5iv-nav-button-next">►</a>
+</div><footer class="ltx_page_footer">
+<a class="ar5iv-toggle-color-scheme" href="javascript:toggleColorScheme()" title="Toggle ar5iv color scheme"><span class="color-scheme-icon"></span></a>
+<a class="ar5iv-footer-button" href="https://arxiv.org/help/license" target="_blank">Copyright</a>
+<a class="ar5iv-footer-button" href="https://arxiv.org/help/policies/privacy_policy" target="_blank">Privacy Policy</a>
+
+<div class="ltx_page_logo">Generated  on Fri Mar  1 15:47:28 2024 by <a target="_blank" href="http://dlmf.nist.gov/LaTeXML/" class="ltx_LaTeXML_logo"><span style="letter-spacing:-0.2em; margin-right:0.1em;">L<span class="ltx_font_smallcaps" style="position:relative; bottom:2.2pt;">a</span>T<span class="ltx_font_smallcaps" style="font-size:120%;position:relative; bottom:-0.2ex;">e</span></span><span style="font-size:90%; position:relative; bottom:-0.2ex;">XML</span><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAsAAAAOCAYAAAD5YeaVAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9wKExQZLWTEaOUAAAAddEVYdENvbW1lbnQAQ3JlYXRlZCB3aXRoIFRoZSBHSU1Q72QlbgAAAdpJREFUKM9tkL+L2nAARz9fPZNCKFapUn8kyI0e4iRHSR1Kb8ng0lJw6FYHFwv2LwhOpcWxTjeUunYqOmqd6hEoRDhtDWdA8ApRYsSUCDHNt5ul13vz4w0vWCgUnnEc975arX6ORqN3VqtVZbfbTQC4uEHANM3jSqXymFI6yWazP2KxWAXAL9zCUa1Wy2tXVxheKA9YNoR8Pt+aTqe4FVVVvz05O6MBhqUIBGk8Hn8HAOVy+T+XLJfLS4ZhTiRJgqIoVBRFIoric47jPnmeB1mW/9rr9ZpSSn3Lsmir1fJZlqWlUonKsvwWwD8ymc/nXwVBeLjf7xEKhdBut9Hr9WgmkyGEkJwsy5eHG5vN5g0AKIoCAEgkEkin0wQAfN9/cXPdheu6P33fBwB4ngcAcByHJpPJl+fn54mD3Gg0NrquXxeLRQAAwzAYj8cwTZPwPH9/sVg8PXweDAauqqr2cDjEer1GJBLBZDJBs9mE4zjwfZ85lAGg2+06hmGgXq+j3+/DsixYlgVN03a9Xu8jgCNCyIegIAgx13Vfd7vdu+FweG8YRkjXdWy329+dTgeSJD3ieZ7RNO0VAXAPwDEAO5VKndi2fWrb9jWl9Esul6PZbDY9Go1OZ7PZ9z/lyuD3OozU2wAAAABJRU5ErkJggg==" alt="Mascot Sammy"></a>
+</div></footer>
+</div>
+
+    <script>
+      var canMathML = typeof(MathMLElement) == "function";
+      if (!canMathML) {
+        var body = document.querySelector("body");
+        body.firstElementChild.setAttribute('style', 'opacity: 0;');
+        var loading = document.createElement("div");
+        loading.setAttribute("id", "mathjax-loading-spinner");
+        var message = document.createElement("div");
+        message.setAttribute("id", "mathjax-loading-message");
+        message.innerText = "Typesetting Equations...";
+        body.prepend(loading);
+        body.prepend(message);
+
+        var el = document.createElement("script");
+        el.src = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js";
+        document.querySelector("head").appendChild(el);
+
+        window.MathJax = {
+          startup: {
+            pageReady: () => {
+              return MathJax.startup.defaultPageReady().then(() => {
+                body.removeChild(loading);
+                body.removeChild(message);
+                body.firstElementChild.removeAttribute('style');
+              }); } } };
+      }
+    </script>
+    <script>
+    // Auxiliary function, building the preview feature when
+    // an inline citation is clicked
+    function clicked_cite(e) {
+      e.preventDefault();
+      let cite = this.closest('.ltx_cite');
+      let next = cite.nextSibling;
+      if (next && next.nodeType == Node.ELEMENT_NODE && next.getAttribute('class') == "ar5iv-bibitem-preview") {
+        next.remove();
+        return; }
+      // Before adding a preview modal,
+      // cleanup older previews, in case they're still open
+      document.querySelectorAll('span.ar5iv-bibitem-preview').forEach(function(node) {
+        node.remove();
+      })
+
+      // Create the preview
+      preview = document.createElement('span');
+      preview.setAttribute('class','ar5iv-bibitem-preview');
+      let target = document.getElementById(this.getAttribute('href').slice(1));
+      target.childNodes.forEach(function (child) {
+        preview.append(child.cloneNode(true));
+      });
+      let close_x = document.createElement('button');
+      close_x.setAttribute("aria-label","Close modal for bibliography item preview");
+      close_x.textContent = "×";
+      close_x.setAttribute('class', 'ar5iv-button-close-preview');
+      close_x.setAttribute('onclick','this.parentNode.remove()');
+      preview.append(close_x);
+      preview.querySelectorAll('.ltx_tag_bibitem').forEach(function(node) {
+        node.remove();
+      });
+      cite.parentNode.insertBefore(preview, cite.nextSibling);
+      return;
+    }
+    // Global Document initialization:
+    // - assign the preview feature to all inline citation links
+    document.querySelectorAll(".ltx_cite .ltx_ref").forEach(function (link) {
+      link.addEventListener("click", clicked_cite);
+    });
+    </script>
+    </body>
+</html>
