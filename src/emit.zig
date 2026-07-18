@@ -683,9 +683,33 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
 
 pub fn emitBlock(buf: []u8, regmap: *const RegisterMap, ops: []const IROp) []u8 {
     var ctx = EmitContext.init(buf, regmap);
-    // Prologue: mov r14, imm64 (slot at offset 2-9, patched at translation)
+    // Prologue: load R14 with state pointer (slot patched at translation)
     ctx.byte(0x49); ctx.byte(0xBE);
     ctx.bytes(&[8]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    // Load all mapped host regs from state via R14
+    for (regmap.*, 0..) |maybe_host, arm_i| {
+        const host = maybe_host orelse continue;
+        if (arm_i == 8) continue;
+        const off: u32 = @as(u32, @intCast(arm_i)) * 8;
+        if (off < 128) {
+            ctx.rex(true, @intFromEnum(host), 0, @intFromEnum(X86Reg.r14));
+            ctx.byte(0x8B);
+            ctx.modrm(0b01, @intFromEnum(host), @intFromEnum(X86Reg.r14));
+            ctx.byte(@intCast(off));
+        } else {
+            ctx.rex(true, @intFromEnum(host), 0, @intFromEnum(X86Reg.r14));
+            ctx.byte(0x8B);
+            ctx.modrm(0b10, @intFromEnum(host), @intFromEnum(X86Reg.r14));
+            ctx.disp32(@intCast(off));
+        }
+    }
+    // x8 at offset 64
+    if (regmap[8] != null) {
+        ctx.rex(true, @intFromEnum(X86Reg.rax), 0, @intFromEnum(X86Reg.r14));
+        ctx.byte(0x8B);
+        ctx.modrm(0b01, @intFromEnum(X86Reg.rax), @intFromEnum(X86Reg.r14));
+        ctx.byte(64);
+    }
     for (ops) |op| _ = emitOp(&ctx, op);
     if (ctx.offset == 0) emitRet(&ctx);
     return buf[0..ctx.offset];
