@@ -301,15 +301,16 @@ fn buildMsub(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
 
 fn buildSmulh(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // SMULH Xd, Xn, Xm → high 64 bits of signed 128-bit multiply
-    // For MVP: just emit MUL (low result). High part needs x86 IMUL+RDX.
+    // Uses x86 IMUL → RDX:RAX, result in RDX
     const ops = inst.operands.rrr;
-    try buf.append(allocator, .{ .tag = .mul_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .mul_hi_s64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
 }
 
 fn buildUmulh(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // UMULH Xd, Xn, Xm → high 64 bits of unsigned 128-bit multiply
+    // Uses x86 MUL → RDX:RAX, result in RDX
     const ops = inst.operands.rrr;
-    try buf.append(allocator, .{ .tag = .mul_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .mul_hi_u64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
 }
 
 fn buildDiv(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, signed: bool) !void {

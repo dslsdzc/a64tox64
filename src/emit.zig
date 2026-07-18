@@ -264,6 +264,32 @@ fn emitMul(ctx: *EmitContext, op: IROp) void {
     ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
 }
 
+fn emitMulHiS(ctx: *EmitContext, op: IROp) void {
+    // SMULH: signed multiply high → RDX
+    // mov rax, Rn; imul Rm; mov Rd, rdx
+    const dst = mapReg(ctx.regmap, op.dest);
+    const rn = mapReg(ctx.regmap, op.src0);
+    const rm = mapReg(ctx.regmap, op.src1);
+    if (rn != .rax) emitMovReg(ctx, .rax, rn);
+    ctx.rex(true, 0, 0, @intFromEnum(rm));
+    ctx.byte(0xF7);
+    ctx.modrm(0b11, 5, @intFromEnum(rm)); // IMUL r/m64
+    emitMovReg(ctx, dst, .rdx);
+}
+
+fn emitMulHiU(ctx: *EmitContext, op: IROp) void {
+    // UMULH: unsigned multiply high → RDX
+    // mov rax, Rn; mul Rm; mov Rd, rdx
+    const dst = mapReg(ctx.regmap, op.dest);
+    const rn = mapReg(ctx.regmap, op.src0);
+    const rm = mapReg(ctx.regmap, op.src1);
+    if (rn != .rax) emitMovReg(ctx, .rax, rn);
+    ctx.rex(true, 0, 0, @intFromEnum(rm));
+    ctx.byte(0xF7);
+    ctx.modrm(0b11, 4, @intFromEnum(rm)); // MUL r/m64
+    emitMovReg(ctx, dst, .rdx);
+}
+
 fn emitLogical(ctx: *EmitContext, op: IROp, opcode_byte: u8, opcode_rev: u8) void {
     const dst = mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
@@ -589,6 +615,8 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .sbc_i64 => emitSubBorrow(ctx, op),
         .mul_i64 => emitMul(ctx, op),
         .div_u64, .div_s64 => emitDiv(ctx, op, op.tag == .div_s64),
+        .mul_hi_s64 => emitMulHiS(ctx, op),
+        .mul_hi_u64 => emitMulHiU(ctx, op),
         .and_ => emitLogical(ctx, op, 0x21, 0x23),
         .or_ => emitLogical(ctx, op, 0x09, 0x0B),
         .xor_ => emitLogical(ctx, op, 0x31, 0x33),
