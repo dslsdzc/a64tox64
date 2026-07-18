@@ -13,6 +13,11 @@ const Cache = @import("cache.zig");
 const CodeCache = Cache.CodeCache;
 const Elf = @import("elf.zig");
 const RegAlloc = @import("regalloc.zig");
+const Thunk = @import("thunk.zig");
+
+// Dynamic linker (dlopen/dlsym) for host library thunking
+const dlopen = std.posix.dlopen;
+extern fn dlsym(handle: *anyopaque, name: [*:0]const u8) ?*anyopaque;
 
 const IRB = Ir.IRBuffer;
 const IROp = Ir.IROp;
@@ -35,6 +40,9 @@ pub const JitRuntime = struct {
     pending_hints_scores: [31]usize,
     has_pending_hints: bool,
     loaded_libs: std.ArrayListUnmanaged(Elf.DynLib),
+    host_libs: std.StringHashMapUnmanaged(*anyopaque) = .{},
+    thunk_page: ?[]align(4096) u8 = null,
+    thunk_page_offset: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) JitRuntime {
         var rt = JitRuntime{
@@ -49,6 +57,7 @@ pub const JitRuntime = struct {
             .last_block_was_svc = false,
             .last_block_next_pc = 0,
             .last_block_pc = 0,
+            .host_libs = .{},
             .pending_hints_pref = undefined,
             .pending_hints_scores = undefined,
             .has_pending_hints = false,
@@ -87,6 +96,10 @@ pub const JitRuntime = struct {
             lib.needed.deinit(runtime.allocator);
         }
         runtime.loaded_libs.deinit(runtime.allocator);
+        var hli = runtime.host_libs.iterator();
+        while (hli.next()) |entry| runtime.allocator.free(entry.key_ptr.*);
+        runtime.host_libs.deinit(runtime.allocator);
+        if (runtime.thunk_page) |p| std.posix.munmap(p);
     }
 
     pub fn loadElf(runtime: *JitRuntime, elf_bytes: []const u8) !void {
@@ -571,6 +584,40 @@ const tb = try runtime.cache.allocateBlock();
         return next_base;
     }
 
+    fn loadHostLib(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
+        if (runtime.host_libs.get(name)) |h| return h;
+        const c_name = runtime.allocator.dupeZ(u8, name) catch return null;
+        defer runtime.allocator.free(c_name);
+        const handle = dlopen(c_name, std.posix.RTLD.LAZY) orelse return null;
+        const owned = runtime.allocator.dupe(u8, name) catch return null;
+        runtime.host_libs.put(runtime.allocator, owned, handle) catch return null;
+        return handle;
+    }
+
+    fn findHostSym(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
+        var it = runtime.host_libs.iterator();
+        while (it.next()) |entry| {
+            if (dlsym(entry.value_ptr.*, @as([:0]const u8, @ptrCast(name)))) |sym| return sym;
+        }
+        for ([_][]const u8{"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1"}) |lib| {
+            if (runtime.host_libs.contains(lib)) continue;
+            if (runtime.loadHostLib(lib)) |h| {
+                if (dlsym(h, name)) |sym| return sym;
+            }
+        }
+        return null;
+    }
+
+    fn getThunkPage(runtime: *JitRuntime) ![]u8 {
+        if (runtime.thunk_page) |p| return p;
+        const page = try std.posix.mmap(null, 4096,
+            std.posix.PROT{ .READ = true, .WRITE = true, .EXEC = true },
+            std.posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        runtime.thunk_page = page;
+        runtime.thunk_page_offset = 0;
+        return page;
+    }
+
     fn resolvePltEntries(runtime: *JitRuntime) !void {
         for (runtime.loaded_libs.items) |lib| {
             if (lib.symtab == 0 or lib.strtab == 0) continue;
@@ -594,6 +641,27 @@ const tb = try runtime.cache.allocateBlock();
 
                 const sym_idx = Elf.r_sym(r_info);
                 const sym_name = Elf.getSymbolName(guest, base, lib.symtab, lib.strtab, sym_idx) orelse continue;
+
+                // Compute GOT offset for patching
+                const got_off = r_offset - base;
+
+                // Try host library first — generate thunk if found
+                if (got_off + 8 <= guest.len) {
+                    if (runtime.findHostSym(sym_name)) |host_fn| {
+                        const tpage = try runtime.getThunkPage();
+                        if (runtime.thunk_page_offset + @as(usize, Thunk.THUNK_SIZE) <= tpage.len) {
+                            const thunk_buf = tpage[runtime.thunk_page_offset..];
+                            const emitted = Thunk.emitHostThunk(thunk_buf, @intFromPtr(host_fn));
+                            const code_addr = @intFromPtr(tpage.ptr) + runtime.thunk_page_offset;
+                            Thunk.patchThunkCall(emitted, code_addr, @intFromPtr(host_fn));
+                            std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], code_addr, .little);
+                            runtime.thunk_page_offset += emitted.len;
+                        }
+                        continue;
+                    }
+                }
+
+                // Fallback: JIT-translate the ARM64 code
                 const sym_val = Elf.findGlobalSymbol(runtime.loaded_libs.items, sym_name) orelse continue;
 
                 // JIT-translate the ARM64 code at sym_val
@@ -615,11 +683,8 @@ const tb = try runtime.cache.allocateBlock();
                 runtime.guest_base = saved_base;
 
                 // Patch GOT entry to point to translated x86-64 code
-                const got_off = r_offset - base;
-                if (got_off + 8 <= guest.len) {
-                    const x86_addr = @intFromPtr(block.host_addr.ptr);
-                    std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], x86_addr + @as(u64, @bitCast(r_addend)), .little);
-                }
+                const x86_addr = @intFromPtr(block.host_addr.ptr);
+                std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], x86_addr + @as(u64, @bitCast(r_addend)), .little);
             }
         }
     }

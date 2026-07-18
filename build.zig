@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
         .name = "a64tox64",
         .root_module = root_module,
     });
+    exe.linkSystemLibrary("dl");
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
