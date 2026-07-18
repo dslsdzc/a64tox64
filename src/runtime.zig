@@ -58,6 +58,12 @@ pub const JitRuntime = struct {
     }
 
     pub fn deinit(runtime: *JitRuntime) void {
+        // Run fini functions in reverse order
+        var i: usize = runtime.loaded_libs.items.len;
+        while (i > 0) {
+            i -= 1;
+            runtime.runFiniArray(&runtime.loaded_libs.items[i]);
+        }
         runtime.cache.deinit();
         if (runtime.trampoline) |t| std.posix.munmap(t);
         if (runtime.guest_mem_mmap) |m| std.posix.munmap(m);
@@ -328,6 +334,11 @@ pub const JitRuntime = struct {
 
         // JIT-translate PLT entries so GOT points to x86-64 code
         try resolvePltEntries(runtime);
+
+        // Run init functions for all loaded libraries in order
+        for (runtime.loaded_libs.items) |*lib| {
+            runtime.runInitArray(lib);
+        }
     }
 
     fn loadLibsRecursive(runtime: *JitRuntime, names: []const []const u8, base: u64) !u64 {
@@ -420,6 +431,70 @@ pub const JitRuntime = struct {
                 }
             }
         }
+    }
+
+    fn runInitArray(runtime: *JitRuntime, lib: *const Elf.DynLib) void {
+        // DT_INIT (single init function)
+        if (lib.init != 0) {
+            runtime.execAtGuest(lib.init, lib);
+        }
+        // DT_INIT_ARRAY (array of init functions)
+        if (lib.init_array != 0 and lib.init_arraysz > 0) {
+            const num = @as(usize, @intCast(lib.init_arraysz / 8));
+            var i: usize = 0;
+            while (i < num) : (i += 1) {
+                const off = lib.init_array - lib.guest_base + i * 8;
+                if (off + 8 > lib.guest_mem.len) break;
+                const func = std.mem.readInt(u64, lib.guest_mem[@intCast(off)..][0..8], .little);
+                if (func == 0) continue;
+                runtime.execAtGuest(func, lib);
+            }
+        }
+    }
+
+    fn runFiniArray(runtime: *JitRuntime, lib: *const Elf.DynLib) void {
+        // DT_FINI_ARRAY (run in reverse order)
+        if (lib.fini_array != 0 and lib.fini_arraysz > 0) {
+            const num = @as(usize, @intCast(lib.fini_arraysz / 8));
+            var i: usize = num;
+            while (i > 0) {
+                i -= 1;
+                const off = lib.fini_array - lib.guest_base + i * 8;
+                if (off + 8 > lib.guest_mem.len) continue;
+                const func = std.mem.readInt(u64, lib.guest_mem[@intCast(off)..][0..8], .little);
+                if (func == 0) continue;
+                runtime.execAtGuest(func, lib);
+            }
+        }
+        // DT_FINI (single fini function)
+        if (lib.fini != 0) {
+            runtime.execAtGuest(lib.fini, lib);
+        }
+    }
+
+    fn execAtGuest(runtime: *JitRuntime, guest_addr: u64, lib: *const Elf.DynLib) void {
+        // Save current guest state, switch to library, translate & execute, restore
+        const saved_mem = runtime.guest_mem;
+        const saved_base = runtime.guest_base;
+        runtime.guest_mem = lib.guest_mem;
+        runtime.guest_base = lib.guest_base;
+
+        const block = runtime.translateBlock(guest_addr) catch {
+            runtime.guest_mem = saved_mem;
+            runtime.guest_base = saved_base;
+            return;
+        };
+
+        // Execute the translated block
+        const block_fn: *const fn () callconv(.c) void =
+            @ptrCast(@alignCast(block.host_addr.ptr));
+        block_fn();
+
+        // Read RDI result back
+        runtime.state.x[0] = asm volatile ("mov %%rdi, %[r]" : [r] "=r" (-> u64));
+
+        runtime.guest_mem = saved_mem;
+        runtime.guest_base = saved_base;
     }
 };
 
