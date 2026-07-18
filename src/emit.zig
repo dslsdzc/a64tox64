@@ -21,7 +21,7 @@ pub const X86Reg = enum(u4) {
 pub const DefaultMapping: [31]?X86Reg = .{
     .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11, // x0-x7: call-clobbered
     .rax, // x8 → RAX (syscall number)
-    .rbx, .rbp, .r12, .r13, .r14, null,            // x9-x14: callee-saved
+    .rbx, .rbp, .r12, .r13, null, null,            // x9-x14: callee-saved
     null, null, null, null, null, null, null, null, // x15-x22: spill
     null, null, null, null, null, null, null, null, // x23-x30: spill
 };
@@ -716,9 +716,9 @@ pub fn emitTrampoline(buf: []u8) []u8 {
     }
 
     // mov r15, rdi  — save state pointer (r15 is callee-saved, not mapped)
-    ctx.rex(true, @intFromEnum(X86Reg.rdi), 0, @intFromEnum(X86Reg.r15));
+    ctx.rex(true, @intFromEnum(X86Reg.rdi), 0, @intFromEnum(X86Reg.r14));
     ctx.byte(0x89);
-    ctx.modrm(0b11, @intFromEnum(X86Reg.rdi), @intFromEnum(X86Reg.r15));
+    ctx.modrm(0b11, @intFromEnum(X86Reg.rdi), @intFromEnum(X86Reg.r14));
 
     // mov rax, rsi  — save block address
     ctx.rex(true, @intFromEnum(X86Reg.rsi), 0, @intFromEnum(X86Reg.rax));
@@ -730,14 +730,14 @@ pub fn emitTrampoline(buf: []u8) []u8 {
     inline for (mapped_regs, 0..) |reg, i| {
         const off: u8 = @intCast(i * 8);
         // mov reg, [r15 + off]
-        ctx.rex(true, @intFromEnum(reg), 0, @intFromEnum(X86Reg.r15));
+        ctx.rex(true, @intFromEnum(reg), 0, @intFromEnum(X86Reg.r14));
         if (off < 128) {
             ctx.byte(0x8B);
-            ctx.modrm(0b01, @intFromEnum(reg), @intFromEnum(X86Reg.r15));
+            ctx.modrm(0b01, @intFromEnum(reg), @intFromEnum(X86Reg.r14));
             ctx.byte(off);
         } else {
             ctx.byte(0x8B);
-            ctx.modrm(0b10, @intFromEnum(reg), @intFromEnum(X86Reg.r15));
+            ctx.modrm(0b10, @intFromEnum(reg), @intFromEnum(X86Reg.r14));
             ctx.disp32(@intCast(off));
         }
     }
@@ -750,14 +750,14 @@ pub fn emitTrampoline(buf: []u8) []u8 {
     // Store regs back to state
     inline for (mapped_regs, 0..) |reg, i| {
         const off: u8 = @intCast(i * 8);
-        ctx.rex(true, @intFromEnum(reg), 0, @intFromEnum(X86Reg.r15));
+        ctx.rex(true, @intFromEnum(reg), 0, @intFromEnum(X86Reg.r14));
         if (off < 128) {
             ctx.byte(0x89);
-            ctx.modrm(0b01, @intFromEnum(reg), @intFromEnum(X86Reg.r15));
+            ctx.modrm(0b01, @intFromEnum(reg), @intFromEnum(X86Reg.r14));
             ctx.byte(off);
         } else {
             ctx.byte(0x89);
-            ctx.modrm(0b10, @intFromEnum(reg), @intFromEnum(X86Reg.r15));
+            ctx.modrm(0b10, @intFromEnum(reg), @intFromEnum(X86Reg.r14));
             ctx.disp32(@intCast(off));
         }
     }

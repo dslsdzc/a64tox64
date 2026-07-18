@@ -183,15 +183,6 @@ pub const JitRuntime = struct {
         const regmap = RegAlloc.allocateAdv(ir_buf.ops.items, hotness,
             if (maybe_hints) |*h| h else null);
         runtime.has_pending_hints = false;
-        if (guest_pc == 0x400580 or guest_pc == 0x4008e0) {
-    comptime var ri = 0;
-    inline while (ri < 31) : (ri += 1) {
-        if (regmap[ri]) |r| {
-            std.debug.print(" x{d}={s}", .{ri, @tagName(r)});
-        }
-    }
-    std.debug.print("\n", .{});
-}
         runtime.last_block_pc = 0; // consumed
 
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
@@ -255,6 +246,9 @@ const tb = try runtime.cache.allocateBlock();
 
         const block_fn: *const fn () callconv(.c) void =
             @ptrCast(@alignCast(block.host_addr.ptr));
+        if (@intFromPtr(block_fn) < 0x10000) {
+            std.debug.print("CRASH: block_fn near null! pc=0x{X} fn=0x{X}\n", .{guest_pc, @intFromPtr(block_fn)});
+        }
         // Call block and capture all register values in a SINGLE asm block.
         // Uses "=m" constraints to store register values directly to local variables,
         // avoiding Zig's one-output limitation and the register-alias bug where
@@ -277,6 +271,7 @@ const tb = try runtime.cache.allocateBlock();
         const guest_sp = runtime.state.sp;
         asm volatile (
                         \\ mov %[sp], %%r15
+            \\ mov %[fp], %%r11
             \\ call *%%r11
             \\ movq %%rdi, %[v_rdi]
             \\ movq %%rsi, %[v_rsi]
@@ -310,6 +305,7 @@ const tb = try runtime.cache.allocateBlock();
               [v_r15] "=m" (cap_r15),
             : [fp] "{r11}" (block_fn),
               [sp] "r" (guest_sp),
+              [st] "r" (&runtime.state),
               // Load guest state: {reg} constraints set each register before asm
             : .{ .rax = true, .r11 = true, .r15 = true, .memory = true }
         );
