@@ -15,9 +15,48 @@ pub const ET_DYN = 3;
 pub const PT_LOAD = 1;
 pub const PT_DYNAMIC = 2;
 pub const PT_PHDR = 6;
+pub const PT_TLS = 7;
+pub const PT_GNU_EH_FRAME = 0x6474e550;
+pub const PT_GNU_STACK = 0x6474e551;
+pub const PT_GNU_RELRO = 0x6474e552;
 pub const PF_R = 4;
 pub const PF_W = 2;
 pub const PF_X = 1;
+
+// ── Dynamic section tags ─────────────────────────────────────────
+pub const DT_NULL = 0;
+pub const DT_NEEDED = 1;
+pub const DT_STRTAB = 5;
+pub const DT_SYMTAB = 6;
+pub const DT_STRSZ = 10;
+pub const DT_GNU_HASH = 0x6ffffef5;
+pub const DT_INIT = 12;
+pub const DT_FINI = 13;
+pub const DT_INIT_ARRAY = 25;
+pub const DT_FINI_ARRAY = 26;
+pub const DT_INIT_ARRAYSZ = 27;
+pub const DT_FINI_ARRAYSZ = 28;
+pub const DT_PLTGOT = 3;
+pub const DT_PLTRELSZ = 2;
+pub const DT_PLTREL = 20;
+pub const DT_JMPREL = 23;
+pub const DT_RELA = 7;
+pub const DT_RELASZ = 8;
+pub const DT_RELAENT = 9;
+pub const DT_VERNEED = 0x6ffffffe;
+pub const DT_VERNEEDNUM = 0x6fffffff;
+pub const DT_VERSYM = 0x6ffffff0;
+
+// ── Relocation types (R_AARCH64) ─────────────────────────────────
+pub const R_AARCH64_NONE = 0;
+pub const R_AARCH64_ABS64 = 257;
+pub const R_AARCH64_GLOB_DAT = 1025;
+pub const R_AARCH64_JUMP_SLOT = 1026;
+pub const R_AARCH64_RELATIVE = 1027;
+
+// ── Symbol bindings ──────────────────────────────────────────────
+pub const STB_GLOBAL = 1;
+pub const STB_WEAK = 2;
 
 // ── ELF64 header ──────────────────────────────────────────────────
 
@@ -134,6 +173,236 @@ pub fn loadElf(allocator: std.mem.Allocator, elf_bytes: []const u8) !LoadedElf {
     };
 }
 
+// ── Dynamic ELF structures ───────────────────────────────────────
+
+pub const Elf64Dyn = extern struct {
+    d_tag: i64,
+    d_val: u64,
+};
+
+pub const Elf64Sym = extern struct {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+};
+
+pub const Elf64Rela = extern struct {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+};
+
+pub fn r_type(r_info: u64) u64 {
+    return r_info & 0xFFFFFFFF;
+}
+
+pub fn r_sym(r_info: u64) u64 {
+    return r_info >> 32;
+}
+
+// ── Dynamic linker ───────────────────────────────────────────────
+
+pub const DynResult = struct {
+    // Relocation info
+    rela: u64,        // DT_RELA address
+    relasz: u64,      // DT_RELASZ
+    jmprel: u64,      // DT_JMPREL
+    pltrelsz: u64,    // DT_PLTRELSZ
+    pltrel: u64,      // DT_PLTREL (0=RELA, 1=REL)
+    // Symbol tables
+    symtab: u64,      // DT_SYMTAB address
+    strtab: u64,      // DT_STRTAB address
+    strsz: u64,       // DT_STRSZ
+    // Init/fini
+    init: u64,
+    init_array: u64,
+    init_arraysz: u64,
+    fini: u64,
+    fini_array: u64,
+    fini_arraysz: u64,
+    // Loaded dependencies
+    needed: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
+};
+
+/// Parse the .dynamic section and extract all relevant entries.
+pub fn parseDynamic(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16) ?DynResult {
+    var result = DynResult{
+        .rela = 0, .relasz = 0, .jmprel = 0, .pltrelsz = 0, .pltrel = 0,
+        .symtab = 0, .strtab = 0, .strsz = 0,
+        .init = 0, .init_array = 0, .init_arraysz = 0,
+        .fini = 0, .fini_array = 0, .fini_arraysz = 0,
+        .needed = .{ .items = &.{}, .capacity = 0 },
+    };
+
+    // Find the PT_DYNAMIC segment
+    var dyn_vaddr: u64 = 0;
+    var dyn_size: u64 = 0;
+    var i: u16 = 0;
+    while (i < e_phnum) : (i += 1) {
+        const phoff = e_phoff + i * @sizeOf(Elf64Phdr);
+        const p_type = std.mem.readInt(u32, elf_bytes[@intCast(phoff)..][0..4], .little);
+        if (p_type == PT_DYNAMIC) {
+            dyn_vaddr = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 16)..][0..8], .little);
+            dyn_size = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
+            break;
+        }
+    }
+    if (dyn_vaddr == 0) return null;
+
+    // Walk the .dynamic entries
+    // For the MVP, we read .dynamic from the ELF file directly.
+    // In production, .dynamic is in loaded guest memory.
+    // Since guest_base ≈ file offset, read from file at matching offset.
+    // This works for simple cases where .dynamic is in a PT_LOAD segment.
+
+    // Find the PT_LOAD that contains .dynamic to get file offset
+    var load_fileoff: u64 = 0;
+    var load_vaddr: u64 = 0;
+    i = 0;
+    while (i < e_phnum) : (i += 1) {
+        const phoff = e_phoff + i * @sizeOf(Elf64Phdr);
+        const p_type = std.mem.readInt(u32, elf_bytes[@intCast(phoff)..][0..4], .little);
+        if (p_type == PT_LOAD) {
+            const p_vaddr = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 16)..][0..8], .little);
+            const p_offset2 = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 8)..][0..8], .little);
+            const p_memsz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
+            if (dyn_vaddr >= p_vaddr and dyn_vaddr < p_vaddr + p_memsz) {
+                load_fileoff = p_offset2;
+                load_vaddr = p_vaddr;
+                break;
+            }
+        }
+    }
+    if (load_fileoff == 0) return null;
+
+    const dyn_fileoff = load_fileoff + (dyn_vaddr - load_vaddr);
+    const max_entries = @as(usize, @intCast(dyn_size / @sizeOf(Elf64Dyn)));
+    if (max_entries == 0) return null;
+
+    var ents: [128]Elf64Dyn = undefined;
+    const actual_entries = @min(max_entries, ents.len);
+    @memcpy(std.mem.sliceAsBytes(ents[0..actual_entries]), elf_bytes[@intCast(dyn_fileoff)..][0..actual_entries * @sizeOf(Elf64Dyn)]);
+
+    for (ents[0..actual_entries]) |entry| {
+        switch (entry.d_tag) {
+            DT_NULL => break,
+            DT_NEEDED => {},
+            DT_RELA => result.rela = entry.d_val,
+            DT_RELASZ => result.relasz = entry.d_val,
+            DT_JMPREL => result.jmprel = entry.d_val,
+            DT_PLTRELSZ => result.pltrelsz = entry.d_val,
+            DT_PLTREL => result.pltrel = @intCast(entry.d_val),
+            DT_SYMTAB => result.symtab = entry.d_val,
+            DT_STRTAB => result.strtab = entry.d_val,
+            DT_STRSZ => result.strsz = entry.d_val,
+            DT_INIT => result.init = entry.d_val,
+            DT_FINI => result.fini = entry.d_val,
+            DT_INIT_ARRAY => result.init_array = entry.d_val,
+            DT_INIT_ARRAYSZ => result.init_arraysz = entry.d_val,
+            DT_FINI_ARRAY => result.fini_array = entry.d_val,
+            DT_FINI_ARRAYSZ => result.fini_arraysz = entry.d_val,
+            else => {},
+        }
+    }
+    return result;
+}
+
+/// Apply relocations in guest memory.
+/// guest: the loaded guest memory
+/// guest_base: base address of the loaded ELF
+/// elf_bytes: the original ELF file bytes
+/// returns: number of relocations applied
+pub fn applyRelocations(guest: []u8, guest_base: u64, elf_bytes: []const u8, e_phoff: u64, e_phnum: u16) !usize {
+    const dyn = parseDynamic(elf_bytes, e_phoff, e_phnum) orelse return 0;
+    var count: usize = 0;
+
+    // Apply RELA relocations (non-PLT)
+    if (dyn.rela != 0 and dyn.relasz > 0) {
+        const num_rela = @as(usize, @intCast(dyn.relasz / @sizeOf(Elf64Rela)));
+        var i: usize = 0;
+        while (i < num_rela) : (i += 1) {
+            const rela_off = loadVaddrToFileOffset(elf_bytes, e_phoff, e_phnum, dyn.rela + i * @sizeOf(Elf64Rela)) orelse continue;
+            if (rela_off + @sizeOf(Elf64Rela) > elf_bytes.len) continue;
+
+            const r_offset = std.mem.readInt(u64, elf_bytes[@intCast(rela_off)..][0..8], .little);
+            const r_info = std.mem.readInt(u64, elf_bytes[@intCast(rela_off + 8)..][0..8], .little);
+            const r_addend = std.mem.readInt(i64, elf_bytes[@intCast(rela_off + 16)..][0..8], .little);
+            const r_type2 = r_type(r_info);
+
+            if (r_type2 == R_AARCH64_RELATIVE) {
+                // R_AARCH64_RELATIVE: *r_offset = guest_base + addend
+                const target_off = r_offset - guest_base;
+                if (target_off + 8 <= guest.len) {
+                    const value = guest_base + @as(u64, @bitCast(r_addend));
+                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
+                    count += 1;
+                }
+            } else if (r_type2 == R_AARCH64_GLOB_DAT) {
+                // R_AARCH64_GLOB_DAT: *r_offset = symbol value
+                // For now, resolve as relative (workaround for simple cases)
+                const sym_idx = r_sym(r_info);
+                const sym_val = findSymbolValue(elf_bytes, e_phoff, e_phnum, dyn.symtab, dyn.strtab, dyn.strsz, sym_idx) orelse 0;
+                const target_off = r_offset - guest_base;
+                if (target_off + 8 <= guest.len) {
+                    const value = if (sym_val != 0) guest_base + sym_val else guest_base;
+                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
+                    count += 1;
+                }
+            } else if (r_type2 == R_AARCH64_JUMP_SLOT) {
+                // R_AARCH64_JUMP_SLOT: PLT entry – set to zero (will be lazily resolved)
+                const target_off = r_offset - guest_base;
+                if (target_off + 8 <= guest.len) {
+                    const sym_idx = r_sym(r_info);
+                    const sym_val = findSymbolValue(elf_bytes, e_phoff, e_phnum, dyn.symtab, dyn.strtab, dyn.strsz, sym_idx) orelse 0;
+                    const value = if (sym_val != 0) guest_base + sym_val else 0;
+                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
+                    count += 1;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+/// Find the file offset that corresponds to a given virtual address.
+fn loadVaddrToFileOffset(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, vaddr: u64) ?u64 {
+    var i: u16 = 0;
+    while (i < e_phnum) : (i += 1) {
+        const phoff = e_phoff + i * @sizeOf(Elf64Phdr);
+        const p_type = std.mem.readInt(u32, elf_bytes[@intCast(phoff)..][0..4], .little);
+        if (p_type != PT_LOAD) continue;
+        const p_offset = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 8)..][0..8], .little);
+        const p_vaddr = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 16)..][0..8], .little);
+        const p_memsz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
+        if (vaddr >= p_vaddr and vaddr < p_vaddr + p_memsz) {
+            return p_offset + (vaddr - p_vaddr);
+        }
+    }
+    return null;
+}
+
+/// Find the value (address) of a symbol by index.
+fn findSymbolValue(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, symtab_vaddr: u64, strtab_vaddr: u64, strsz: u64, sym_idx: u64) ?u64 {
+    if (sym_idx == 0) return null; // STN_UNDEF
+    const sym_off = loadVaddrToFileOffset(elf_bytes, e_phoff, e_phnum, symtab_vaddr + sym_idx * @sizeOf(Elf64Sym)) orelse return null;
+    if (sym_off + @sizeOf(Elf64Sym) > elf_bytes.len) return null;
+
+    const st_name = std.mem.readInt(u32, elf_bytes[@intCast(sym_off)..][0..4], .little);
+    const st_value = std.mem.readInt(u64, elf_bytes[@intCast(sym_off + 8)..][0..8], .little); // skip st_info + st_other + st_shndx
+    const st_shndx = std.mem.readInt(u16, elf_bytes[@intCast(sym_off + 6)..][0..2], .little);
+    _ = st_shndx;
+
+    // For defined symbols (st_value != 0), return the value
+    if (st_value != 0) return st_value;
+    _ = strtab_vaddr;
+    _ = strsz;
+    _ = st_name;
+    return null;
+}
+
 // ── ELF binary builder (for tests) ────────────────────────────────
 //
 // Builds a minimal ARM64 static ELF executable in memory.
@@ -238,6 +507,16 @@ test "buildMinimalElf generates valid ELF" {
     try std.testing.expectEqual(@as(u16, EM_AARCH64), std.mem.readInt(u16, elf[18..20], .little));
     // Check entry point
     try std.testing.expectEqual(@as(u64, 0x10000), std.mem.readInt(u64, elf[24..32], .little));
+}
+
+test "parseDynamic returns null for static ELF" {
+    const code = [_]u8{ 0x00, 0x00, 0x5F, 0xD6 };
+    const elf_bytes = try buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf_bytes);
+    const e_phoff = std.mem.readInt(u64, elf_bytes[32..40], .little);
+    const e_phnum = std.mem.readInt(u16, elf_bytes[56..58], .little);
+    const dyn = parseDynamic(elf_bytes, e_phoff, e_phnum);
+    try std.testing.expect(dyn == null);
 }
 
 test "loadElf rejects non-ARM64" {
