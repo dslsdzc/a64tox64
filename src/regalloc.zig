@@ -41,7 +41,6 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         m.* = if (i == 8) @as(?X86Reg, .rax) else null;
     }
 
-    // Score each ARM64 register: usage × hotness + hint bonus
     var score: [31]f32 = undefined;
     for (&score) |*s| s.* = 0;
     for (ops) |op| {
@@ -49,25 +48,29 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         if (op.src0 < 31) score[op.src0] += 1.0;
         if (op.src1 < 31 and op.src1 != 0x1F) score[op.src1] += 1.0;
     }
-
-    // Apply hotness multiplier
     if (hotness > 1.0) {
         for (&score) |*s| s.* *= hotness;
     }
 
-    // Add hint bonuses
+    // Strong hints: reserve preferred host regs before frequency assignment
+    var used_hosts = std.mem.zeroes([16]bool);
+    var hint_arm = std.mem.zeroes([31]bool);
     if (hints) |h| {
-        for (&score, 0..) |*s, i| {
-            if (h.pref[i] != null) {
-                s.* += @as(f32, @floatFromInt(h.scores[i]));
+        for (h.pref, 0..) |maybe_reg, arm_i| {
+            if (maybe_reg) |reg| {
+                const host_idx = @intFromEnum(reg);
+                if (host_idx < 16 and host_idx != 8 and !used_hosts[host_idx]) {
+                    mapping[arm_i] = reg;
+                    used_hosts[host_idx] = true;
+                    hint_arm[arm_i] = true;
+                }
             }
         }
     }
 
-    // Sort ARM64 register indices by score
+    // Sort by frequency
     var sorted: [30]usize = undefined;
     for (&sorted, 0..) |*s, i| s.* = i;
-
     var i: usize = 0;
     while (i < sorted.len) : (i += 1) {
         var best = i;
@@ -75,33 +78,37 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         while (j < sorted.len) : (j += 1) {
             if (score[sorted[j]] > score[sorted[best]]) best = j;
         }
-        const tmp = sorted[i];
-        sorted[i] = sorted[best];
-        sorted[best] = tmp;
+        const tmp = sorted[i]; sorted[i] = sorted[best]; sorted[best] = tmp;
     }
 
-    // Assign host registers: highest-scored ARM regs get mapped
-    // Callee-saved regs go to highest-scored ARM regs (preserved across calls)
+    // Assign non-hinted ARM regs via frequency
     var used: usize = 0;
     var callee_used: usize = 0;
-    const num_callee: usize = 4; // RBX, RBP, R12, R13 (R14=state_ptr, R15=SP)
-    const num_clobber: usize = 8; // RDI, RSI, RDX, RCX, R8-R11
+    const num_callee: usize = 4;
+    const num_clobber: usize = 8;
 
     for (sorted) |arm| {
-        if (arm == 8) continue; // x8 → RAX
-
-        // Assign to host register pool
-        // High-score ARM regs get callee-saved (preserved across function calls)
-        // Lower-score ARM regs get call-clobbered
-        if (callee_used < num_callee) {
+        if (arm == 8) continue;
+        if (hint_arm[arm]) continue;
+        while (callee_used < num_callee) {
             const host_idx = num_clobber + callee_used;
-            mapping[arm] = host_regs[host_idx];
+            if (!used_hosts[host_idx]) {
+                mapping[arm] = host_regs[host_idx];
+                used_hosts[host_idx] = true;
+                callee_used += 1;
+                break;
+            }
             callee_used += 1;
-        } else if (used < num_clobber) {
-            mapping[arm] = host_regs[used];
-            used += 1;
         } else {
-            break; // no more host registers
+            while (used < num_clobber) {
+                if (!used_hosts[used]) {
+                    mapping[arm] = host_regs[used];
+                    used_hosts[used] = true;
+                    used += 1;
+                    break;
+                }
+                used += 1;
+            } else break;
         }
     }
 
@@ -109,7 +116,7 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
     return mapping;
 }
 
-/// Build exit hints from a block's register state, to pass to successor blocks.
+/// Build exit hints
 pub fn exitHints(map: RegisterMap) RegHints {
     var hints: RegHints = undefined;
     for (&hints.pref) |*p| p.* = null;
