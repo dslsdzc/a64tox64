@@ -391,25 +391,28 @@ fn buildCSel(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
 fn buildCSinc(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // CSINC Xd, Xn, Xm, cond = Xd = cond ? Xn : Xm + 1
     const ops = inst.operands.csel;
+    // Precompute false-case: x16 = Rm + 1
     try buf.append(allocator, .{ .tag = .add_i64, .dest = 16, .src0 = ops.rm, .src1 = 0x1F, .flags = 0, .imm = 1 });
-    try buf.append(allocator, .{ .tag = .nzcv_read, .dest = 0, .src0 = @intFromEnum(ops.cond), .src1 = 0, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 0, .flags = 0, .imm = 0 });
+    // CMOV: Rd = cond ? Rn : x16 (src1=16 = x16 = false value)
+    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = @intFromEnum(ops.cond), .imm = 0 });
 }
 
 fn buildCSinv(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // CSINV Xd, Xn, Xm, cond = Xd = cond ? Xn : ~Xm
     const ops = inst.operands.csel;
+    // Precompute false-case: x16 = ~Rm
     try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .nzcv_read, .dest = 0, .src0 = @intFromEnum(ops.cond), .src1 = 0, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 0, .flags = 0, .imm = 0 });
+    // CMOV: Rd = cond ? Rn : x16
+    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = @intFromEnum(ops.cond), .imm = 0 });
 }
 
 fn buildCSneg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // CSNEG Xd, Xn, Xm, cond = Xd = cond ? Xn : -Xm
     const ops = inst.operands.csel;
+    // Precompute false-case: x16 = -Rm
     try buf.append(allocator, .{ .tag = .neg_i64, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .nzcv_read, .dest = 0, .src0 = @intFromEnum(ops.cond), .src1 = 0, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 0, .flags = 0, .imm = 0 });
+    // CMOV: Rd = cond ? Rn : x16
+    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = @intFromEnum(ops.cond), .imm = 0 });
 }
 
 // ═══════════════════════════════════════════════════════════════════
