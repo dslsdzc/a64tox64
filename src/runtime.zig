@@ -172,12 +172,12 @@ pub const JitRuntime = struct {
             };
         };
 
-        // Call the translated block directly
+        // Call the translated block
         const block_fn: *const fn () callconv(.c) void =
             @ptrCast(@alignCast(block.host_addr.ptr));
         block_fn();
 
-        // Read all mapped/used registers back to state
+        // Save all mapped registers back to state
         runtime.state.x[0] = asm volatile ("mov %%rdi, %[r]" : [r] "=r" (-> u64));
         runtime.state.x[1] = asm volatile ("mov %%rsi, %[r]" : [r] "=r" (-> u64));
         runtime.state.x[2] = asm volatile ("mov %%rdx, %[r]" : [r] "=r" (-> u64));
@@ -187,6 +187,12 @@ pub const JitRuntime = struct {
         runtime.state.x[6] = asm volatile ("mov %%r10, %[r]" : [r] "=r" (-> u64));
         runtime.state.x[7] = asm volatile ("mov %%r11, %[r]" : [r] "=r" (-> u64));
         runtime.state.x[8] = asm volatile ("mov %%rax, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[9] = asm volatile ("mov %%rbx, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[10] = asm volatile ("mov %%rbp, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[11] = asm volatile ("mov %%r12, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[12] = asm volatile ("mov %%r13, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[13] = asm volatile ("mov %%r14, %[r]" : [r] "=r" (-> u64));
+        runtime.state.x[14] = asm volatile ("mov %%r15, %[r]" : [r] "=r" (-> u64));
 
         // Chain to next block for direct branches
         if (!runtime.last_block_was_svc and block.chain_type == .direct) {

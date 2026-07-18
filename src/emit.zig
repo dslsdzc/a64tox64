@@ -15,12 +15,15 @@ pub const X86Reg = enum(u4) {
     r12 = 12, r13 = 13, r14 = 14, r15 = 15,
 };
 
-/// Default register mapping: ARM64 x0-x7 → x86-64 host registers.
+/// Extended register mapping: ARM64 x0-x13 → x86-64 host registers.
+/// Uses all 14 available GP registers (8 call-clobbered + 6 callee-saved).
+/// x14-x30 → spill to RAX (temporary).
 pub const DefaultMapping: [31]?X86Reg = .{
-    .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11,
-    null, null, null, null, null, null, null, null,
-    null, null, null, null, null, null, null, null,
-    null, null, null, null, null, null, null,
+    .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11, // x0-x7: call-clobbered
+    .rax, // x8 → RAX (syscall number)
+    .rbx, .rbp, .r12, .r13, .r14, .r15,            // x9-x14: callee-saved
+    null, null, null, null, null, null, null, null, // x15-x22: spill
+    null, null, null, null, null, null, null, null, // x23-x30: spill
 };
 
 pub const RegisterMap = [31]?X86Reg;
