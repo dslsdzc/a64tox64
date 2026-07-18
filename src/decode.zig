@@ -239,10 +239,12 @@ fn decodeOpcode(raw: u32) Opcode {
     if ((raw & 0x7E000000) == 0x36000000) return .tbz;
     if ((raw & 0x7E000000) == 0x37000000) return .tbnz;
 
-    // LDPSW (bit 31+30 = 10, vs LDP 32-bit = 00)
-    if ((raw & 0xFFC00000) == 0xAA000000) return .ldpsw;  // signed offset
-    if ((raw & 0xFFC00000) == 0xAA800000) return .ldpsw;  // pre-index
-    if ((raw & 0xFFC00000) == 0xAA400000) return .ldpsw;  // post-index
+    // LDPSW disabled — original check (0xAA000000) falsely matched ORR (0xAA0003E5).
+    // The correct encoding is 01 0 10 0 XX 00 0 0 for bits 31-22 (opc=01, V=0).
+    // No LDPSW instructions found in real binaries, so disabled until needed.
+    // if ((raw & 0x7FC00000) == 0x50000000) return .ldpsw;  // signed offset
+    // if ((raw & 0x7FC00000) == 0x52800000) return .ldpsw;  // pre-index
+    // if ((raw & 0x7FC00000) == 0x51000000) return .ldpsw;  // post-index
 
     // SMULH/UMULH (3-source group with Ra=31, bits 23-22 = 10/11)
     if ((raw & 0xFFE00000) == 0x9B400000 and (raw & 0x0000FC00) == 0x00007C00) return .smulh;
