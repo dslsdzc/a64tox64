@@ -358,10 +358,34 @@ fn emitRet(ctx: *EmitContext) void {
 }
 
 fn emitBrCond(ctx: *EmitContext, op: IROp) void {
-    _ = op;
-    ctx.byte(0x0F);
-    ctx.byte(0x84);
-    ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 });
+    // ARM64 condition code in op.flags → x86-64 JCC opcode
+    const jcc_opcode: u8 = switch (op.flags & 0xF) {
+        0b0000 => 0x84, // EQ  → JE  (ZF=1)
+        0b0001 => 0x85, // NE  → JNE (ZF=0)
+        0b0010 => 0x83, // CS/HS → JAE (CF=0) — C=1 in ARM64 = CF=0 in x86
+        0b0011 => 0x82, // CC/LO → JB  (CF=1) — C=0 in ARM64 = CF=1 in x86
+        0b0100 => 0x88, // MI  → JS  (SF=1)
+        0b0101 => 0x89, // PL  → JNS (SF=0)
+        0b0110 => 0x80, // VS  → JO  (OF=1)
+        0b0111 => 0x81, // VC  → JNO (OF=0)
+        0b1000 => 0x87, // HI  → JA  (CF=0 & ZF=0)
+        0b1001 => 0x86, // LS  → JBE (CF=1 | ZF=1)
+        0b1010 => 0x8D, // GE  → JGE (SF=OF)
+        0b1011 => 0x8C, // LT  → JL  (SF≠OF)
+        0b1100 => 0x8F, // GT  → JG  (ZF=0 & SF=OF)
+        0b1101 => 0x8E, // LE  → JLE (ZF=1 | SF≠OF)
+        0b1110 => 0x00, // AL  → JMP (unconditional, handled separately)
+        else => 0x84,   // default to JE
+    };
+
+    if ((op.flags & 0xF) == 0b1110) {
+        // AL = unconditional: JMP rel32
+        ctx.byte(0xE9);
+    } else {
+        ctx.byte(0x0F);
+        ctx.byte(jcc_opcode);
+    }
+    ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 }); // placeholder offset
 }
 
 fn emitNZCVUpdate(ctx: *EmitContext) void {

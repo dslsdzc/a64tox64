@@ -533,8 +533,8 @@ fn buildRet(buf: *IRBuffer, allocator: std.mem.Allocator) !void {
 
 fn buildBCond(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
     const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + inst.operands.bcond.label));
-    try buf.append(allocator, .{ .tag = .nzcv_read, .dest = 0, .src0 = @intFromEnum(inst.operands.bcond.cond), .src1 = 0, .flags = 0, .imm = @truncate(target) });
-    try buf.append(allocator, .{ .tag = .br_cond, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = @truncate(target) });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .br_cond, .dest = 0, .src0 = 0, .src1 = 0, .flags = @intFromEnum(inst.operands.bcond.cond), .imm = @truncate(target) });
 }
 
 fn buildCCmp(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
