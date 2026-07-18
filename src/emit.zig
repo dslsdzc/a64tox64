@@ -69,6 +69,7 @@ pub const EmitContext = struct {
 };
 
 fn mapReg(regmap: *const RegisterMap, arm_reg: u16) X86Reg {
+    if (arm_reg >= 31) return .rax; // XZR → RAX as sentinel
     return regmap[arm_reg] orelse .rax;
 }
 

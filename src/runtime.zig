@@ -25,6 +25,7 @@ pub const JitRuntime = struct {
     cache: CodeCache,
     guest_mem: ?[]u8,
     guest_mem_mmap: ?[]align(4096) u8,
+    guest_stack: ?[]align(4096) u8,
     guest_base: u64,
     trampoline: ?[]align(4096) u8,
     last_block_was_svc: bool,
@@ -38,6 +39,7 @@ pub const JitRuntime = struct {
             .cache = CodeCache.init(allocator),
             .guest_mem = null,
             .guest_mem_mmap = null,
+            .guest_stack = null,
             .guest_base = 0,
             .trampoline = null,
             .last_block_was_svc = false,
@@ -68,6 +70,7 @@ pub const JitRuntime = struct {
         runtime.cache.deinit();
         if (runtime.trampoline) |t| std.posix.munmap(t);
         if (runtime.guest_mem_mmap) |m| std.posix.munmap(m);
+        if (runtime.guest_stack) |s| std.posix.munmap(s);
         for (runtime.loaded_libs.items) |*lib| {
             runtime.allocator.free(lib.guest_mem);
             for (lib.needed.items) |n| runtime.allocator.free(n);
@@ -91,6 +94,15 @@ pub const JitRuntime = struct {
         runtime.guest_mem = guest_page[0..loaded.guest_mem.len];
         runtime.guest_mem_mmap = guest_page;
         runtime.state.pc = loaded.entry;
+        // Set up guest stack
+        const stack_page = try std.posix.mmap(
+            null, 1024 * 1024,
+            std.posix.PROT{ .READ = true, .WRITE = true },
+            std.posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1, 0,
+        );
+        runtime.guest_stack = stack_page;
+        runtime.state.sp = @intFromPtr(stack_page.ptr) + 1024 * 1024;
 
         // Handle dynamic linking if present
         const e_phoff = std.mem.readInt(u64, elf_bytes[32..40], .little);
@@ -147,7 +159,7 @@ pub const JitRuntime = struct {
         }
         const csize = estimateCodeSize(ir_buf.ops.items);
         const cpage = try runtime.cache.allocateCodePage(csize);
-        const regmap = RegAlloc.allocate(ir_buf.ops.items);
+        const regmap = Emit.DefaultMapping; // Use fixed mapping until per-block allocator is synced with save/restore
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
         const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
@@ -200,10 +212,19 @@ pub const JitRuntime = struct {
             };
         };
 
-        // Call the translated block
         const block_fn: *const fn () callconv(.c) void =
             @ptrCast(@alignCast(block.host_addr.ptr));
-        block_fn();
+        // Pre-load SP into RAX, then call block (all in one asm to prevent clobber)
+        const guest_sp = runtime.state.sp;
+        asm volatile (
+            \\ mov %[sp], %%rax
+            \\ mov %[func], %%r11
+            \\ call *%%r11
+            :
+            : [sp] "r" (guest_sp),
+              [func] "r" (block_fn),
+            : .{ .rax = true, .r11 = true, .memory = true }
+        );
 
         // Save all mapped registers back to state
         runtime.state.x[0] = asm volatile ("mov %%rdi, %[r]" : [r] "=r" (-> u64));
