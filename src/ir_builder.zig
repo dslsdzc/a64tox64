@@ -270,13 +270,13 @@ fn buildShift(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: 
 fn buildCmp(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.rrr;
     try buf.append(allocator, .{ .tag = .sub_i64, .dest = 0x1F, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 1 }); // imm=1 = CMC needed
 }
 
 fn buildCmn(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.rrr;
     try buf.append(allocator, .{ .tag = .add_i64, .dest = 0x1F, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 }); // imm=0 = no CMC
 }
 
 // ═══════════════════════════════════════════════════════════════════

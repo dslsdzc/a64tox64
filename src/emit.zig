@@ -422,8 +422,10 @@ fn emitBrCond(ctx: *EmitContext, op: IROp) void {
     ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 }); // placeholder offset
 }
 
-fn emitNZCVUpdate(ctx: *EmitContext) void {
-    _ = ctx;
+fn emitNZCVUpdate(ctx: *EmitContext, op: IROp) void {
+    if (op.imm != 0) {
+        ctx.byte(0xF5); // CMC: complement carry flag
+    }
 }
 
 fn emitNZCVRead(ctx: *EmitContext, op: IROp) void {
@@ -466,7 +468,7 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .ret_ => emitRet(ctx),
         .br_cond => emitBrCond(ctx, op),
 
-        .nzcv_update => emitNZCVUpdate(ctx),
+        .nzcv_update => emitNZCVUpdate(ctx, op),
         .nzcv_read => emitNZCVRead(ctx, op),
 
         else => ctx.byte(0xCC),
