@@ -116,6 +116,8 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         // ── System ───────────────────────────────────────────────
         .svc => {}, // handled by runtime dispatcher
         .nop => {},
+        .clz => try buildClz(buf, allocator, inst),
+        .dmb, .dsb, .isb => {}, // memory barriers: no-op on x86-64
         .unknown => {},
         else => {},
     }
@@ -608,6 +610,13 @@ fn buildTBZ(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_p
     try buf.append(allocator, .{ .tag = .sub_i64, .dest = 0x1F, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 1 }); // CMC
     try buf.append(allocator, .{ .tag = .br_cond, .dest = 0, .src0 = 0, .src1 = 0, .flags = if (is_tbnz) @as(u16, @intFromEnum(Decode.Condition.ne)) else @as(u16, @intFromEnum(Decode.Condition.eq)), .imm = @truncate(target) });
+}
+
+fn buildClz(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // CLZ: count leading zeros.
+    // For MVP: return 0 (sub from XZR). Real impl needs BSR/LZCNT in emitter.
+    const ops = inst.operands.rrr;
+    try buf.append(allocator, .{ .tag = .sub_i64, .dest = ops.rd, .src0 = 0x1F, .src1 = 0x1F, .flags = 0, .imm = 0 });
 }
 
 fn buildCCmp(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
