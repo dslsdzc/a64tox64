@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+a64tox64
+gen_elf
+test_extern
+*.bak

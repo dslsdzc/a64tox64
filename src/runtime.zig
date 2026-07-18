@@ -30,7 +30,11 @@ pub const JitRuntime = struct {
     trampoline: ?[]align(4096) u8,
     last_block_was_svc: bool,
     last_block_next_pc: u64,
-    loaded_libs: std.ArrayListUnmanaged(Elf.DynLib) = .{ .items = &.{}, .capacity = 0 },
+    last_block_pc: u64,
+    pending_hints_pref: [31]?Emit.X86Reg,
+    pending_hints_scores: [31]usize,
+    has_pending_hints: bool,
+    loaded_libs: std.ArrayListUnmanaged(Elf.DynLib),
 
     pub fn init(allocator: std.mem.Allocator) JitRuntime {
         var rt = JitRuntime{
@@ -44,6 +48,10 @@ pub const JitRuntime = struct {
             .trampoline = null,
             .last_block_was_svc = false,
             .last_block_next_pc = 0,
+            .last_block_pc = 0,
+            .pending_hints_pref = undefined,
+            .pending_hints_scores = undefined,
+            .has_pending_hints = false,
             .loaded_libs = .{ .items = &.{}, .capacity = 0 },
         };
         var tbuf: [Emit.TRAMPOLINE_SIZE]u8 = undefined;
@@ -57,6 +65,8 @@ pub const JitRuntime = struct {
         ) catch @panic("mmap trampoline failed");
         @memcpy(tramp_page[0..emitted.len], emitted);
         rt.trampoline = tramp_page[0..emitted.len];
+        @memset(&rt.pending_hints_pref, null);
+        @memset(&rt.pending_hints_scores, 0);
         return rt;
     }
 
@@ -159,10 +169,26 @@ pub const JitRuntime = struct {
         }
         const csize = estimateCodeSize(ir_buf.ops.items);
         const cpage = try runtime.cache.allocateCodePage(csize);
-        const regmap = Emit.DefaultMapping; // Use fixed mapping until per-block allocator is synced with save/restore
+
+        // Per-block register allocation with hotness and predecessor hints.
+        // Hotness: backward branch target → likely loop → score multiplier.
+        // Hints: predecessor block's register mapping → prefer same host regs.
+        const hotness: f32 = if (runtime.last_block_pc > guest_pc) 2.0 else 1.0;
+        const maybe_hints: ?RegAlloc.RegHints = if (runtime.has_pending_hints) h: {
+            break :h RegAlloc.RegHints{
+                .pref = runtime.pending_hints_pref,
+                .scores = runtime.pending_hints_scores,
+            };
+        } else null;
+        const regmap = RegAlloc.allocateAdv(ir_buf.ops.items, hotness,
+            if (maybe_hints) |*h| h else null);
+        runtime.has_pending_hints = false;
+        runtime.last_block_pc = 0; // consumed
+
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
-        const tb = try runtime.cache.allocateBlock();
+const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
+        tb.regmap = regmap;
         tb.chain_type = switch (last_opcode) {
             .b => .direct,
             .b_cond => .cond,
@@ -173,25 +199,31 @@ pub const JitRuntime = struct {
         tb.fallthrough_pc = pc;
         try runtime.cache.insert(tb);
 
-        // Hardware chaining: patch JMP placeholders if target already translated
-        if (emitted.len >= 5 and last_opcode != .ret_ and last_opcode != .svc) {
+        // Hardware chaining: patch JMP/CALL placeholders if target already translated
+        if (emitted.len >= 6 and last_opcode != .ret_ and last_opcode != .svc) {
             const branch_kind: enum { jmp, jcc, call, none } = brk: {
-                if (emitted.len >= 5) {
-                    if (emitted[emitted.len - 5] == 0xE9) break :brk .jmp;
-                    if (emitted[emitted.len - 5] == 0xE8) break :brk .call;
-                }
+                // JMP (E9 rel32) — 5 bytes at end: E9 xx xx xx xx
+                if (emitted.len >= 5 and emitted[emitted.len - 5] == 0xE9) break :brk .jmp;
+                // CALL+RET (E8 rel32 C3) — 6 bytes: E8 xx xx xx xx C3
+                if (emitted.len >= 6 and emitted[emitted.len - 6] == 0xE8 and emitted[emitted.len - 1] == 0xC3) break :brk .call;
+                // JCC (0F 8x rel32) — 6 bytes: 0F 8x xx xx xx xx
                 if (emitted.len >= 6 and emitted[emitted.len - 6] == 0x0F) {
                     const second = emitted[emitted.len - 5];
                     if (second >= 0x80 and second <= 0x8F) break :brk .jcc;
                 }
                 break :brk .none;
             };
-            // Only chain direct JMP (B). JCC needs fallthrough, CALL needs return handling.
-            if (branch_kind == .jmp and tb.chain_type == .direct) {
-                const patch_offset = emitted.len - 4; // rel32 is always last 4 bytes
-                // Try to link to target if already translated
+            // Patch rel32 for JMP and CALL if target already translated
+            if ((branch_kind == .jmp and tb.chain_type == .direct) or
+                (branch_kind == .call and tb.chain_type == .call))
+            {
+                const patch_offset = blk: {
+                    if (branch_kind == .call) break :blk emitted.len - 5; // rel32 before C3
+                    break :blk emitted.len - 4; // JMP rel32 at last 4 bytes
+                };
                 if (runtime.cache.lookup(tb.chain_target)) |target_blk| {
-                    const src_end = @intFromPtr(emitted.ptr) + emitted.len;
+                    const src_end = @intFromPtr(emitted.ptr) + emitted.len -
+                        if (branch_kind == .call) @as(usize, 1) else 0;
                     const target_addr = @intFromPtr(target_blk.host_addr.ptr);
                     const rel32: i32 = @intCast(target_addr - src_end);
                     std.mem.writeInt(i32, emitted[patch_offset..][0..4], rel32, .little);
@@ -214,47 +246,123 @@ pub const JitRuntime = struct {
 
         const block_fn: *const fn () callconv(.c) void =
             @ptrCast(@alignCast(block.host_addr.ptr));
-        // Pre-load SP into RAX, then call block (all in one asm to prevent clobber)
+        // Call block and capture all register values in a SINGLE asm block.
+        // Uses "=m" constraints to store register values directly to local variables,
+        // avoiding Zig's one-output limitation and the register-alias bug where
+        // multiple "=r" outputs silently share the same register.
+        var cap_rdi: u64 = undefined;
+        var cap_rsi: u64 = undefined;
+        var cap_rdx: u64 = undefined;
+        var cap_rcx: u64 = undefined;
+        var cap_r8: u64 = undefined;
+        var cap_r9: u64 = undefined;
+        var cap_r10: u64 = undefined;
+        var cap_r11: u64 = undefined;
+        var cap_rax: u64 = undefined;
+        var cap_rbx: u64 = undefined;
+        var cap_rbp: u64 = undefined;
+        var cap_r12: u64 = undefined;
+        var cap_r13: u64 = undefined;
+        var cap_r14: u64 = undefined;
+        var cap_r15: u64 = undefined;
         const guest_sp = runtime.state.sp;
         asm volatile (
-            \\ mov %[sp], %%rax
-            \\ mov %[func], %%r11
+                        \\ mov %[sp], %%r15
+            \\ mov %[fp], %%r11
             \\ call *%%r11
-            :
-            : [sp] "r" (guest_sp),
-              [func] "r" (block_fn),
-            : .{ .rax = true, .r11 = true, .memory = true }
+            \\ movq %%rdi, %[v_rdi]
+            \\ movq %%rsi, %[v_rsi]
+            \\ movq %%rdx, %[v_rdx]
+            \\ movq %%rcx, %[v_rcx]
+            \\ movq %%r8, %[v_r8]
+            \\ movq %%r9, %[v_r9]
+            \\ movq %%r10, %[v_r10]
+            \\ movq %%r11, %[v_r11]
+            \\ movq %%rax, %[v_rax]
+            \\ movq %%rbx, %[v_rbx]
+            \\ movq %%rbp, %[v_rbp]
+            \\ movq %%r12, %[v_r12]
+            \\ movq %%r13, %[v_r13]
+            \\ movq %%r14, %[v_r14]
+            \\ movq %%r15, %[v_r15]
+            : [v_rdi] "=m" (cap_rdi),
+              [v_rsi] "=m" (cap_rsi),
+              [v_rdx] "=m" (cap_rdx),
+              [v_rcx] "=m" (cap_rcx),
+              [v_r8] "=m" (cap_r8),
+              [v_r9] "=m" (cap_r9),
+              [v_r10] "=m" (cap_r10),
+              [v_r11] "=m" (cap_r11),
+              [v_rax] "=m" (cap_rax),
+              [v_rbx] "=m" (cap_rbx),
+              [v_rbp] "=m" (cap_rbp),
+              [v_r12] "=m" (cap_r12),
+              [v_r13] "=m" (cap_r13),
+              [v_r14] "=m" (cap_r14),
+              [v_r15] "=m" (cap_r15),
+            : [fp] "r" (block_fn),
+              [sp] "r" (guest_sp),
+            : .{ .rax = true, .r11 = true, .r15 = true, .memory = true }
         );
 
-        // Save all mapped registers back to state
-        runtime.state.x[0] = asm volatile ("mov %%rdi, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[1] = asm volatile ("mov %%rsi, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[2] = asm volatile ("mov %%rdx, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[3] = asm volatile ("mov %%rcx, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[4] = asm volatile ("mov %%r8, %[r]"  : [r] "=r" (-> u64));
-        runtime.state.x[5] = asm volatile ("mov %%r9, %[r]"  : [r] "=r" (-> u64));
-        runtime.state.x[6] = asm volatile ("mov %%r10, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[7] = asm volatile ("mov %%r11, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[8] = asm volatile ("mov %%rax, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[9] = asm volatile ("mov %%rbx, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[10] = asm volatile ("mov %%rbp, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[11] = asm volatile ("mov %%r12, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[12] = asm volatile ("mov %%r13, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[13] = asm volatile ("mov %%r14, %[r]" : [r] "=r" (-> u64));
-        runtime.state.x[14] = asm volatile ("mov %%r15, %[r]" : [r] "=r" (-> u64));
+        // Copy captured values to guest state using the block's register map.
+        // The per-block allocator may assign ARM64 registers to different host
+        // registers than the DefaultMapping — we must route via the stored regmap.
+        for (block.regmap, 0..) |maybe_host, arm_i| {
+            const val = if (maybe_host) |host| switch (host) {
+                .rdi => cap_rdi, .rsi => cap_rsi, .rdx => cap_rdx,
+                .rcx => cap_rcx, .r8  => cap_r8,  .r9  => cap_r9,
+                .r10 => cap_r10, .r11 => cap_r11, .rax => cap_rax,
+                .rbx => cap_rbx, .rbp => cap_rbp, .r12 => cap_r12,
+                .r13 => cap_r13, .r14 => cap_r14, .r15 => cap_r15,
+                .rsp => unreachable,
+            } else continue;
+            runtime.state.x[arm_i] = val;
+        }
+
+        // Track execution count for hotness profiling
+        block.exec_count +|= 1;
+
+        // Compute exit hints from this block's register mapping.
+        // Passed to successor blocks so they prefer the same host register
+        // assignments, reducing cross-block register movement.
+        const exit_hints = RegAlloc.exitHints(block.regmap);
 
         // Chain to next block for direct branches
         if (!runtime.last_block_was_svc and block.chain_type == .direct) {
+            runtime.storeHints(exit_hints);
+            runtime.last_block_pc = block.guest_pc;
+            runtime.execute(block.chain_target);
+            return;
+        }
+        // BL (call): ensure target is translated, then recursively execute it.
+        // If hardware chaining patched the CALL rel32, the block's CALL jumps
+        // directly and the target's RET + our RET returns to execute().
+        // If not patched (target wasn't cached at translation time), the CALL
+        // falls through to RET and we handle it here.
+        if (!runtime.last_block_was_svc and block.chain_type == .call) {
+            runtime.storeHints(exit_hints);
+            runtime.last_block_pc = block.guest_pc;
             runtime.execute(block.chain_target);
             return;
         }
         // SVC or indirect: handle normally
         if (runtime.last_block_was_svc) {
-            // SVC: handle syscall and continue
+            // Pass hints to the SVC handler's next block
+            runtime.storeHints(exit_hints);
+            runtime.last_block_pc = block.guest_pc;
             runtime.last_block_was_svc = false;
             handleSyscall(runtime);
             runtime.execute(runtime.last_block_next_pc);
         }
+        // Fallthrough (no chain): hints are lost — no successor to pass to
+        // This is fine; the next call from top-level execute() has no predecessor.
+    }
+
+    fn storeHints(runtime: *JitRuntime, hints: RegAlloc.RegHints) void {
+        runtime.has_pending_hints = true;
+        runtime.pending_hints_pref = hints.pref;
+        runtime.pending_hints_scores = hints.scores;
     }
 
     fn syscallNumber(arm: u64) i64 {
@@ -497,6 +605,9 @@ pub const JitRuntime = struct {
                 runtime.guest_mem = lib.guest_mem;
                 runtime.guest_base = lib.guest_base;
 
+                // Don't carry hints from guest execution — PLT is unrelated
+                runtime.has_pending_hints = false;
+                runtime.last_block_pc = 0;
                 const block = runtime.translateBlock(sym_val) catch {
                     runtime.guest_mem = saved_mem;
                     runtime.guest_base = saved_base;
@@ -562,6 +673,9 @@ pub const JitRuntime = struct {
         runtime.guest_mem = lib.guest_mem;
         runtime.guest_base = lib.guest_base;
 
+        // Don't carry hints — init/fini is unrelated to guest execution
+        runtime.has_pending_hints = false;
+        runtime.last_block_pc = 0;
         const block = runtime.translateBlock(guest_addr) catch {
             runtime.guest_mem = saved_mem;
             runtime.guest_base = saved_base;
@@ -573,8 +687,66 @@ pub const JitRuntime = struct {
             @ptrCast(@alignCast(block.host_addr.ptr));
         block_fn();
 
-        // Read RDI result back
-        runtime.state.x[0] = asm volatile ("mov %%rdi, %[r]" : [r] "=r" (-> u64));
+        // Read x0 back using the block's register map
+        // (per-block allocator may map x0 to any host register)
+        var cap_rdi: u64 = undefined;
+        var cap_rsi: u64 = undefined;
+        var cap_rdx: u64 = undefined;
+        var cap_rcx: u64 = undefined;
+        var cap_r8: u64 = undefined;
+        var cap_r9: u64 = undefined;
+        var cap_r10: u64 = undefined;
+        var cap_r11: u64 = undefined;
+        var cap_rax: u64 = undefined;
+        var cap_rbx: u64 = undefined;
+        var cap_rbp: u64 = undefined;
+        var cap_r12: u64 = undefined;
+        var cap_r13: u64 = undefined;
+        var cap_r14: u64 = undefined;
+        var cap_r15: u64 = undefined;
+        asm volatile (
+            \\ movq %%rdi, %[v_rdi]
+            \\ movq %%rsi, %[v_rsi]
+            \\ movq %%rdx, %[v_rdx]
+            \\ movq %%rcx, %[v_rcx]
+            \\ movq %%r8, %[v_r8]
+            \\ movq %%r9, %[v_r9]
+            \\ movq %%r10, %[v_r10]
+            \\ movq %%r11, %[v_r11]
+            \\ movq %%rax, %[v_rax]
+            \\ movq %%rbx, %[v_rbx]
+            \\ movq %%rbp, %[v_rbp]
+            \\ movq %%r12, %[v_r12]
+            \\ movq %%r13, %[v_r13]
+            \\ movq %%r14, %[v_r14]
+            \\ movq %%r15, %[v_r15]
+            : [v_rdi] "=m" (cap_rdi),
+              [v_rsi] "=m" (cap_rsi),
+              [v_rdx] "=m" (cap_rdx),
+              [v_rcx] "=m" (cap_rcx),
+              [v_r8] "=m" (cap_r8),
+              [v_r9] "=m" (cap_r9),
+              [v_r10] "=m" (cap_r10),
+              [v_r11] "=m" (cap_r11),
+              [v_rax] "=m" (cap_rax),
+              [v_rbx] "=m" (cap_rbx),
+              [v_rbp] "=m" (cap_rbp),
+              [v_r12] "=m" (cap_r12),
+              [v_r13] "=m" (cap_r13),
+              [v_r14] "=m" (cap_r14),
+              [v_r15] "=m" (cap_r15),
+            :
+            : .{ .memory = true }
+        );
+
+        runtime.state.x[0] = switch (block.regmap[0] orelse .rdi) {
+            .rdi => cap_rdi, .rsi => cap_rsi, .rdx => cap_rdx,
+            .rcx => cap_rcx, .r8  => cap_r8,  .r9  => cap_r9,
+            .r10 => cap_r10, .r11 => cap_r11, .rax => cap_rax,
+            .rbx => cap_rbx, .rbp => cap_rbp, .r12 => cap_r12,
+            .r13 => cap_r13, .r14 => cap_r14, .r15 => cap_r15,
+            .rsp => unreachable,
+        };
 
         runtime.guest_mem = saved_mem;
         runtime.guest_base = saved_base;
@@ -748,4 +920,35 @@ test "SUB + MOVZ pipeline" {
     runtime.execute(runtime.state.pc);
     try std.testing.expectEqual(@as(u64, 40), runtime.state.x[0]);
     try std.testing.expectEqual(@as(u64, 7), runtime.state.x[2]);
+}
+
+test "SVC register capture: x0 and x8 preserved" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{
+        0x40, 0x05, 0x80, 0xD2,  // MOVZ X0, #42
+        0xA8, 0x0B, 0x80, 0xD2,  // MOVZ X8, #93 (__NR_exit)
+        0x01, 0x00, 0x00, 0xD4,  // SVC #0
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc);
+    try std.testing.expectEqual(@as(u64, 42), runtime.state.x[0]);
+    try std.testing.expectEqual(@as(u64, 93), runtime.state.x[8]);
+}
+
+test "SVC getpid returns positive PID" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{
+        0x08, 0x15, 0x80, 0xD2,  // MOVZ X8, #172 (__NR_getpid)
+        0x01, 0x00, 0x00, 0xD4,  // SVC #0
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc);
+    try std.testing.expect(runtime.state.x[0] > 0);
+    try std.testing.expectEqual(@as(u64, 172), runtime.state.x[8]);
 }

@@ -16,7 +16,7 @@ const RegisterMap = Emit.RegisterMap;
 /// last 6 are callee-saved (preferred for high-frequency ARM64 regs).
 const host_regs = [_]X86Reg{
     .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11,
-    .rbx, .rbp, .r12, .r13, .r14, .r15,
+    .rbx, .rbp, .r12, .r13, .r14,
 };
 
 /// Register allocation hints from predecessor blocks.
@@ -84,7 +84,7 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
     // Callee-saved regs go to highest-scored ARM regs (preserved across calls)
     var used: usize = 0;
     var callee_used: usize = 0;
-    const num_callee: usize = 6; // RBX, RBP, R12-R15
+    const num_callee: usize = 5; // RBX, RBP, R12, R13, R14 (R15 reserved for SP)
     const num_clobber: usize = 8; // RDI, RSI, RDX, RCX, R8-R11
 
     for (sorted) |arm| {

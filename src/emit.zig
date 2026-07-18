@@ -21,7 +21,7 @@ pub const X86Reg = enum(u4) {
 pub const DefaultMapping: [31]?X86Reg = .{
     .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11, // x0-x7: call-clobbered
     .rax, // x8 → RAX (syscall number)
-    .rbx, .rbp, .r12, .r13, .r14, .r15,            // x9-x14: callee-saved
+    .rbx, .rbp, .r12, .r13, .r14, null,            // x9-x14: callee-saved
     null, null, null, null, null, null, null, null, // x15-x22: spill
     null, null, null, null, null, null, null, null, // x23-x30: spill
 };
@@ -70,7 +70,7 @@ pub const EmitContext = struct {
 
 fn mapReg(regmap: *const RegisterMap, arm_reg: u16) X86Reg {
     if (arm_reg >= 31) return .rax; // XZR → RAX as sentinel
-    return regmap[arm_reg] orelse .rax;
+    return regmap[arm_reg] orelse .r11;
 }
 
 /// Returns true if the ARM64 register is XZR (the zero register).
@@ -389,7 +389,13 @@ fn emitLoad(ctx: *EmitContext, op: IROp) void {
     if (offset == 0) {
         ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(base));
         ctx.byte(0x8B);
-        ctx.modrm(0b00, @intFromEnum(dst), @intFromEnum(base));
+        // RBP/R13 with mod=00 encodes as RIP-relative on x86-64. Use mod=01 + 0-displacement.
+        if (@intFromEnum(base) & 0x07 == 0b101) {
+            ctx.modrm(0b01, @intFromEnum(dst), @intFromEnum(base));
+            ctx.byte(0);
+        } else {
+            ctx.modrm(0b00, @intFromEnum(dst), @intFromEnum(base));
+        }
     } else if (offset <= 0x7F) {
         ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(base));
         ctx.byte(0x8B);
@@ -404,14 +410,20 @@ fn emitLoad(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitStore(ctx: *EmitContext, op: IROp) void {
-    const base = mapReg(ctx.regmap, op.src0);
+    const base_ = mapReg(ctx.regmap, op.src0);
+    const base: X86Reg = if (base_ == .rax) .r15 else base_;
     const src = mapReg(ctx.regmap, op.src1);
     const offset = op.imm;
 
     if (offset == 0) {
         ctx.rex(true, @intFromEnum(src), 0, @intFromEnum(base));
         ctx.byte(0x89);
-        ctx.modrm(0b00, @intFromEnum(src), @intFromEnum(base));
+        if (@intFromEnum(base) & 0x07 == 0b101) {
+            ctx.modrm(0b01, @intFromEnum(src), @intFromEnum(base));
+            ctx.byte(0);
+        } else {
+            ctx.modrm(0b00, @intFromEnum(src), @intFromEnum(base));
+        }
     } else if (offset <= 0x7F) {
         ctx.rex(true, @intFromEnum(src), 0, @intFromEnum(base));
         ctx.byte(0x89);
@@ -440,8 +452,12 @@ fn emitBranch(ctx: *EmitContext, op: IROp) void {
 
 fn emitCall(ctx: *EmitContext, op: IROp) void {
     _ = op;
+    // CALL rel32=0 (placeholder — patched by chaining code if target cached)
     ctx.byte(0xE8);
     ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 });
+    // RET after CALL — when target returns, control goes back to execute()
+    // Also serves as safe fallthrough if CALL never gets patched (rel32=0 → next insn)
+    ctx.byte(0xC3);
 }
 
 fn emitCallReg(ctx: *EmitContext, op: IROp) void {
@@ -650,6 +666,15 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
 
         .nzcv_update => emitNZCVUpdate(ctx, op),
         .nzcv_read => emitNZCVRead(ctx, op),
+
+        .sp_get => {
+            const dst = mapReg(ctx.regmap, op.dest);
+            emitMovReg(ctx, dst, .r15);
+        },
+        .sp_put => {
+            const src = mapReg(ctx.regmap, op.src0);
+            emitMovReg(ctx, .r15, src);
+        },
 
         else => ctx.byte(0xCC),
     }

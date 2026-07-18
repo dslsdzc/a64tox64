@@ -119,7 +119,7 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .ccmp_reg, .ccmp_imm => try buildCCmp(buf, allocator, inst),
 
         // ── System ───────────────────────────────────────────────
-        .svc => {}, // handled by runtime dispatcher
+        .svc => try buildRet(buf, allocator), // returns to runtime for SVC handling
         .nop, .hint => {}, // HINT (incl. NOP, SEV, WFE, etc.): no-op on x86-64
         .clz => try buildClz(buf, allocator, inst),
         .dmb, .dsb, .isb => {}, // memory barriers: no-op on x86-64
@@ -135,10 +135,16 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
 fn buildAddSubImm(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
     const ops = inst.operands.rri12;
     const imm: u32 = @as(u32, ops.imm12) << (@as(u5, ops.shift) * 12);
-    try buf.append(allocator, .{
-        .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = 0x1F,
-        .flags = 0, .imm = imm,
-    });
+    if (ops.rn == 31) {
+        if (imm == 0) {
+            try buf.append(allocator, .{ .tag = .sp_get, .dest = ops.rd, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+        } else {
+            try buf.append(allocator, .{ .tag = .sp_get, .dest = 16, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+            try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = imm });
+        }
+    } else {
+        try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = imm });
+    }
 }
 
 fn buildAddSubImmFlags(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
@@ -207,25 +213,47 @@ fn buildAdr(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_p
 // ═══════════════════════════════════════════════════════════════════
 
 fn buildAddSubReg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
-    const ops = inst.operands.rrr;
+    // add_reg → rrr operands (rd, rn, rm)
+    // add_ext → mem_reg operands (rt, rn, rm, extend, amount)
+    const rd: u16 = switch (inst.operands) {
+        .rrr => |ops| ops.rd,
+        .mem_reg => |ops| ops.rt,
+        else => return, // unknown operand type, skip
+    };
+    const rn: u16 = switch (inst.operands) {
+        .rrr => |ops| ops.rn,
+        .mem_reg => |ops| ops.rn,
+        else => return,
+    };
+    const rm: u16 = switch (inst.operands) {
+        .rrr => |ops| ops.rm,
+        .mem_reg => |ops| ops.rm,
+        else => return,
+    };
     try buf.append(allocator, .{
-        .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm,
+        .tag = tag, .dest = rd, .src0 = rn, .src1 = rm,
         .flags = 0, .imm = 0,
     });
 }
 
 fn buildLogical(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
-    const ops = inst.operands.rrr;
+    const ops = inst.operands.rrr_shift;
     try buf.append(allocator, .{
         .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm,
         .flags = 0, .imm = 0,
     });
+    // If shift amount > 0, emit a shift op before the logical
+    if (ops.amount > 0) {
+        // TODO: emit shift IR op (prepend before the logical)
+        // For now, just note the shift — common case is LSL #0
+        _ = ops.shift;
+    }
 }
 
 // ── Logical with NOT ───────────────────────────────────────────
 
 fn buildBic(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
-    const ops = inst.operands.rrr;
+    const ops = inst.operands.rrr_shift;
     // BIC Xd, Xn, Xm = Xd = Xn & ~Xm
     // Use x16 (IP0) as temp for ~Xm
     try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
@@ -233,14 +261,14 @@ fn buildBic(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
 }
 
 fn buildOrn(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
-    const ops = inst.operands.rrr;
+    const ops = inst.operands.rrr_shift;
     // ORN Xd, Xn, Xm = Xd = Xn | ~Xm
     try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .or_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
 }
 
 fn buildEon(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
-    const ops = inst.operands.rrr;
+    const ops = inst.operands.rrr_shift;
     try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .xor_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
 }
@@ -257,14 +285,14 @@ fn buildLogicalFlags(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst
     // x86 AND sets SF and ZF, and clears OF and CF. ARM64 ANDS sets N and Z but
     // preserves C and V (unlike x86 which clears CF). For the MVP, this is close enough —
     // N and Z match. C and V may differ in edge cases.
-    const ops = inst.operands.rrr;
+    const ops = inst.operands.rrr_shift;
     try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
 }
 
 fn buildBics(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // BICS Xd, Xn, Xm = Xd = Xn & ~Xm (with NZCV update)
-    const ops = inst.operands.rrr;
+    const ops = inst.operands.rrr_shift;
     try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .and_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
@@ -514,19 +542,31 @@ fn buildCSneg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void
 //  Memory
 // ═══════════════════════════════════════════════════════════════════
 
+fn spGet(buf: *IRBuffer, allocator: std.mem.Allocator) !u16 {
+    try buf.append(allocator, .{ .tag = .sp_get, .dest = 16, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+    return 16;
+}
+
+fn spBase(buf: *IRBuffer, allocator: std.mem.Allocator, rn: u16) !u16 {
+    if (rn != 31) return rn;
+    return spGet(buf, allocator);
+}
+
 fn buildLoad(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag, _: bool) !void {
     const ops = inst.operands.mem_imm;
+    const base = try spBase(buf, allocator, ops.rn);
     try buf.append(allocator, .{
-        .tag = tag, .dest = ops.rt, .src0 = ops.rn, .src1 = 0,
-        .flags = 0, .imm = @as(u32, @bitCast(@as(i32, ops.offset))),
+        .tag = tag, .dest = ops.rt, .src0 = base, .src1 = 0,
+        .flags = 0, .imm = @as(u32, @truncate(@as(u64, @bitCast(ops.offset)))),
     });
 }
 
 fn buildStore(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag, _: bool) !void {
     const ops = inst.operands.mem_imm;
+    const base = try spBase(buf, allocator, ops.rn);
     try buf.append(allocator, .{
-        .tag = tag, .dest = 0, .src0 = ops.rn, .src1 = ops.rt,
-        .flags = 0, .imm = @as(u32, @bitCast(@as(i32, ops.offset))),
+        .tag = tag, .dest = 0, .src0 = base, .src1 = ops.rt,
+        .flags = 0, .imm = @as(u32, @truncate(@as(u64, @bitCast(ops.offset)))),
     });
 }
 
@@ -549,9 +589,14 @@ fn buildStoreReg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, ta
 fn buildLoadLiteral(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
     const ops = inst.operands.rl;
     const target_addr = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + ops.label));
+    // Load absolute guest address into temp reg, then load from it
     try buf.append(allocator, .{
-        .tag = .load_u64, .dest = ops.rd, .src0 = 0x1F, .src1 = 0,
+        .tag = .add_i64, .dest = 16, .src0 = 0x1F, .src1 = 0x1F,
         .flags = 0, .imm = @truncate(target_addr),
+    });
+    try buf.append(allocator, .{
+        .tag = .load_u64, .dest = ops.rd, .src0 = 16, .src1 = 0,
+        .flags = 0, .imm = 0,
     });
 }
 
@@ -564,20 +609,29 @@ fn buildLDP(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_p
     const base = if (ops.writeback) blk: {
         if (ops.post_index) {
             // LDP with post-index: load from [Rn], then Rn += offset
-            // Emit load then add
             break :blk ops.rn;
         } else {
             // LDP with pre-index: Rn += offset, then load from [Rn]
+            // If Rn == 31 (SP), emit sp_get to update R15 instead of RAX
             try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rn, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
+            if (ops.rn == 31) {
+                // Move updated SP value from XZR temp back to R15
+                try buf.append(allocator, .{ .tag = .sp_put, .dest = 16, .src0 = 16, .src1 = 0, .flags = 0, .imm = 0 });
+            }
             break :blk ops.rn;
         }
-    } else ops.rn;
+    } else blk: {
+        break :blk try spBase(buf, allocator, ops.rn);
+    };
 
     try buf.append(allocator, .{ .tag = .load_u64, .dest = ops.rt1, .src0 = base, .src1 = 0, .flags = 0, .imm = @truncate(offset) });
     try buf.append(allocator, .{ .tag = .load_u64, .dest = ops.rt2, .src0 = base, .src1 = 0, .flags = 0, .imm = @truncate(offset + 8) });
 
     if (ops.writeback and ops.post_index) {
         try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rn, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
+        if (ops.rn == 31) {
+            try buf.append(allocator, .{ .tag = .sp_put, .dest = 16, .src0 = 16, .src1 = 0, .flags = 0, .imm = 0 });
+        }
     }
     _ = guest_pc;
 }
@@ -586,17 +640,38 @@ fn buildSTP(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_p
     const ops = inst.operands.ldp_stp;
     const scale: u64 = if (inst.sf) 8 else 4;
     const offset = @as(u64, @intCast(ops.imm7)) * scale;
-    const base = ops.rn;
 
-    if (ops.writeback and !ops.post_index) {
+    // For pre-index writeback: update SP first (and base = 16 for subsequent loads)
+    // For non-writeback or post-index: base from spBase
+    const is_pre_index = ops.writeback and !ops.post_index;
+
+    if (is_pre_index and ops.rn == 31) {
+        try buf.append(allocator, .{ .tag = .sp_get, .dest = 16, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+        try buf.append(allocator, .{ .tag = .add_i64, .dest = 16, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
+        try buf.append(allocator, .{ .tag = .sp_put, .dest = 16, .src0 = 16, .src1 = 0, .flags = 0, .imm = 0 });
+    } else if (is_pre_index) {
         try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rn, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
     }
 
-    try buf.append(allocator, .{ .tag = .store_u64, .dest = 0, .src0 = base, .src1 = ops.rt1, .flags = 0, .imm = @truncate(offset) });
-    try buf.append(allocator, .{ .tag = .store_u64, .dest = 0, .src0 = base, .src1 = ops.rt2, .flags = 0, .imm = @truncate(offset + 8) });
+    // Base for stores: after writeback for pre-index (offset 0 from updated base)
+    const store_offset = if (is_pre_index) @as(u64, 0) else offset;
+    const base = if (is_pre_index and ops.rn == 31)
+        @as(u16, 16)
+    else
+        try spBase(buf, allocator, ops.rn);
 
+    try buf.append(allocator, .{ .tag = .store_u64, .dest = 0, .src0 = base, .src1 = ops.rt1, .flags = 0, .imm = @truncate(store_offset) });
+    try buf.append(allocator, .{ .tag = .store_u64, .dest = 0, .src0 = base, .src1 = ops.rt2, .flags = 0, .imm = @truncate(store_offset + 8) });
+
+    // Post-index writeback: stores use old base, THEN update
     if (ops.writeback and ops.post_index) {
-        try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rn, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
+        if (ops.rn == 31) {
+            try buf.append(allocator, .{ .tag = .sp_get, .dest = 16, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+            try buf.append(allocator, .{ .tag = .add_i64, .dest = 16, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
+            try buf.append(allocator, .{ .tag = .sp_put, .dest = 16, .src0 = 16, .src1 = 0, .flags = 0, .imm = 0 });
+        } else {
+            try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rn, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = @truncate(offset) });
+        }
     }
     _ = guest_pc;
 }

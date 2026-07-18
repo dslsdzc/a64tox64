@@ -74,6 +74,8 @@ pub const Tag = enum(u16) {
     fcvt,
 
     // ── Meta ─────────────────────────────────────────────────────────
+    sp_get, // R15 → dst
+    sp_put, // src → R15
     entry_point,
     block_start,
     block_end,

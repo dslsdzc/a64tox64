@@ -1,5 +1,7 @@
 //! Translation block — a single-entry, multiple-exit translated code region.
 
+const Emit = @import("emit.zig");
+
 pub const ChainType = enum(u8) {
     none,
     direct,  // B (unconditional branch to known target)
@@ -11,8 +13,10 @@ pub const TranslationBlock = struct {
     guest_pc: u64,
     host_addr: []u8,
     chain_type: ChainType,
-    chain_target: u64, // guest PC of the branch target
-    fallthrough_pc: u64, // next PC after block (for untaken branches)
+    chain_target: u64,
+    fallthrough_pc: u64,
+    regmap: Emit.RegisterMap,
+    exec_count: u32, // number of times executed (hotness signal)
 
     pub fn init(guest_pc: u64, host_addr: []u8) TranslationBlock {
         return .{
@@ -21,6 +25,8 @@ pub const TranslationBlock = struct {
             .chain_type = .none,
             .chain_target = 0,
             .fallthrough_pc = 0,
+            .regmap = Emit.DefaultMapping,
+            .exec_count = 0,
         };
     }
 };

@@ -173,7 +173,7 @@ pub const Operands = union(enum) {
     ri16: struct { rd: u5, imm16: u16 },
     ri16_hw: struct { rd: u5, imm16: u16, hw: u2 },
     rl: struct { rd: u5, label: i64 },
-    mem_imm: struct { rt: u5, rn: u5, offset: i9, size: u2 },
+    mem_imm: struct { rt: u5, rn: u5, offset: i64, size: u2 },
     mem_reg: struct { rt: u5, rn: u5, rm: u5, extend: ExtendType, amount: u3 },
     ldp_stp: struct { rt1: u5, rt2: u5, rn: u5, imm7: i7, load: bool, post_index: bool, writeback: bool },
     b_target: struct { label: i64 },
@@ -551,7 +551,7 @@ fn extractMemImm(raw: u32) Operands {
     const imm12: u12 = @truncate(raw >> 10);
     const size: u2 = @truncate(raw >> 30);
     const scale: u9 = @as(u9, 1) << @intCast(size);
-    const offset: i9 = @as(i9, @intCast(imm12 * scale));
+    const offset: i64 = @as(i64, imm12) * @as(i64, scale);
     return .{ .mem_imm = .{ .rt = rt, .rn = rn, .offset = offset, .size = size } };
 }
 
