@@ -610,11 +610,13 @@ pub fn parseDynamic(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16) ?DynResul
 
     const dyn_fileoff = load_fileoff + (dyn_vaddr - load_vaddr);
     const max_entries = @as(usize, @intCast(dyn_size / @sizeOf(Elf64Dyn)));
-    if (max_entries == 0) return null;
+    if (max_entries == 0 or max_entries > 1024) return null;
 
     var ents: [128]Elf64Dyn = undefined;
     const actual_entries = @min(max_entries, ents.len);
-    @memcpy(std.mem.sliceAsBytes(ents[0..actual_entries]), elf_bytes[@intCast(dyn_fileoff)..][0..actual_entries * @sizeOf(Elf64Dyn)]);
+    const copy_bytes = @as(u32, actual_entries) * @as(u32, @sizeOf(Elf64Dyn));
+    if (dyn_fileoff + copy_bytes > elf_bytes.len) return null;
+    @memcpy(std.mem.sliceAsBytes(ents[0..actual_entries]), elf_bytes[@intCast(dyn_fileoff)..][0..copy_bytes]);
 
     for (ents[0..actual_entries]) |entry| {
         switch (entry.d_tag) {

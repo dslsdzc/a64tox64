@@ -441,8 +441,10 @@ fn emitStore(ctx: *EmitContext, op: IROp) void {
 
 fn emitBranch(ctx: *EmitContext, op: IROp) void {
     if (op.flags == 0) {
+        // JMP rel32=0 (placeholder), then RET for safe fallthrough
         ctx.byte(0xE9);
         ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 });
+        ctx.byte(0xC3); // RET
     } else {
         const t = mapReg(ctx.regmap, op.src0);
         ctx.byte(0xFF);

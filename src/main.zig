@@ -13,6 +13,7 @@ pub const block = @import("block.zig");
 pub const cache = @import("cache.zig");
 pub const runtime = @import("runtime.zig");
 pub const elf = @import("elf.zig");
+pub const thunk = @import("thunk.zig");
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;

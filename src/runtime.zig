@@ -13,6 +13,7 @@ const Cache = @import("cache.zig");
 const CodeCache = Cache.CodeCache;
 const Elf = @import("elf.zig");
 const RegAlloc = @import("regalloc.zig");
+const Thunk = @import("thunk.zig");
 
 const IRB = Ir.IRBuffer;
 const IROp = Ir.IROp;
@@ -104,6 +105,7 @@ pub const JitRuntime = struct {
         runtime.guest_mem = guest_page[0..loaded.guest_mem.len];
         runtime.guest_mem_mmap = guest_page;
         runtime.state.pc = loaded.entry;
+        std.log.debug("base=0x{X} entry=0x{X} mem_len={}", .{runtime.guest_base, runtime.state.pc, runtime.guest_mem.?.len});
         // Set up guest stack
         const stack_page = try std.posix.mmap(
             null, 1024 * 1024,
@@ -205,7 +207,7 @@ const tb = try runtime.cache.allocateBlock();
         if (emitted.len >= 6 and last_opcode != .ret_ and last_opcode != .svc) {
             const branch_kind: enum { jmp, jcc, call, none } = brk: {
                 // JMP (E9 rel32) — 5 bytes at end: E9 xx xx xx xx
-                if (emitted.len >= 5 and emitted[emitted.len - 5] == 0xE9) break :brk .jmp;
+                if (emitted.len >= 5 and emitted[emitted.len - 6] == 0xE9) break :brk .jmp; if (emitted.len >= 6) 
                 // CALL+RET (E8 rel32 C3) — 6 bytes: E8 xx xx xx xx C3
                 if (emitted.len >= 6 and emitted[emitted.len - 6] == 0xE8 and emitted[emitted.len - 1] == 0xC3) break :brk .call;
                 // JCC (0F 8x rel32) — 6 bytes: 0F 8x xx xx xx xx
@@ -367,6 +369,29 @@ const tb = try runtime.cache.allocateBlock();
         }
         // Fallthrough (no chain): hints are lost — no successor to pass to
         // This is fine; the next call from top-level execute() has no predecessor.
+    }
+
+    fn loadHostLib(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
+        if (runtime.host_lib_handles.get(name)) |h| return h;
+        const c_name = runtime.allocator.dupeZ(u8, name) catch return null;
+        defer runtime.allocator.free(c_name);
+        const handle = std.posix.dlopen(c_name, std.posix.RTLD.LAZY) orelse return null;
+        runtime.host_lib_handles.put(runtime.allocator, name, handle) catch {};
+        return handle;
+    }
+
+    fn findHostSymbol(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
+        var hit = runtime.host_lib_handles.iterator();
+        while (hit.next()) |entry| {
+            if (std.posix.dlsym(entry.value_ptr.*, name)) |sym| return sym;
+        }
+        // Try loading common libs if not already loaded
+        for ([_][]const u8{"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1"}) |lib| {
+            if (runtime.host_lib_handles.contains(lib)) continue;
+            const handle = runtime.loadHostLib(lib) orelse continue;
+            if (std.posix.dlsym(handle, name)) |sym| return sym;
+        }
+        return null;
     }
 
     fn storeHints(runtime: *JitRuntime, hints: RegAlloc.RegHints) void {

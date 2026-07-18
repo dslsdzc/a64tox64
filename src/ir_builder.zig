@@ -201,7 +201,7 @@ fn buildMovk(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
 
 fn buildAdr(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
     const ops = inst.operands.rl;
-    const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + ops.label));
+    const target = @as(u64, @bitCast(@as(i64, @intCast(guest_pc)) + ops.label));
     try buf.append(allocator, .{
         .tag = .add_i64, .dest = ops.rd, .src0 = 0x1F, .src1 = 0x1F,
         .flags = 0, .imm = @truncate(target),
@@ -714,7 +714,7 @@ fn buildBCond(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest
 
 fn buildCBZ(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
     const ops = inst.operands.cbz;
-    const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + ops.label));
+    const target = @as(u64, @bitCast(@as(i64, @intCast(guest_pc)) + ops.label));
     const is_cbnz = inst.opcode == .cbnz;
     // CBZ/CBNZ = CMP Xt, XZR + B.EQ/B.NE
     try buf.append(allocator, .{ .tag = .sub_i64, .dest = 0x1F, .src0 = ops.rt, .src1 = 0x1F, .flags = 0, .imm = 0 });
@@ -724,7 +724,7 @@ fn buildCBZ(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_p
 
 fn buildTBZ(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
     const ops = inst.operands.tbz;
-    const target = @as(u64, @intCast(@as(i64, @intCast(guest_pc)) + ops.label));
+    const target = @as(u64, @bitCast(@as(i64, @intCast(guest_pc)) + ops.label));
     const is_tbnz = inst.opcode == .tbnz;
     // TBZ/TBNZ = test bit and branch
     // LSR X16, Xt, #bit; AND X16, X16, #1; CMP X16, XZR; B.EQ/B.NE
