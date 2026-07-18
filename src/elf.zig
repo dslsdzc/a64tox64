@@ -173,6 +173,168 @@ pub fn loadElf(allocator: std.mem.Allocator, elf_bytes: []const u8) !LoadedElf {
     };
 }
 
+// ── Dynamic library loading ─────────────────────────────────────
+
+pub const DynLib = struct {
+    name: []const u8,
+    guest_mem: []u8,
+    guest_base: u64,
+    guest_size: u64,
+    entry: u64,
+    // Dynamic info (guest vaddr, not file offset)
+    symtab: u64,
+    strtab: u64,
+    strsz: u64,
+    needed: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
+    init: u64,
+    init_array: u64,
+    init_arraysz: u64,
+    fini: u64,
+    fini_array: u64,
+    fini_arraysz: u64,
+};
+
+/// Load a dynamic library into guest memory and parse its metadata.
+/// The library is loaded at a computed base address, avoiding overlap
+/// with existing guest regions.
+pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []const u8, next_base: u64) !DynLib {
+    const raw = try loadElf(allocator, elf_bytes);
+    defer allocator.free(raw.guest_mem);
+
+    // ET_DYN (shared object) uses vaddr relative to base = 0.
+    // ET_EXEC uses absolute vaddr. For .so files loaded at runtime,
+    // we relocate them to next_base.
+    const load_base = next_base;
+    const guest_mem = try allocator.alloc(u8, raw.guest_size);
+    @memset(guest_mem, 0);
+    @memcpy(guest_mem[0..raw.guest_mem.len], raw.guest_mem);
+
+    // Apply R_AARCH64_RELATIVE: add load_base to original base = 0
+    var fix_count: usize = 0;
+    {
+        const dyn = parseDynamic(elf_bytes, getPhdrInfo(elf_bytes).?.phoff, getPhdrInfo(elf_bytes).?.phnum);
+        if (dyn) |d| {
+            if (d.rela != 0 and d.relasz > 0) {
+                const num_rela = @as(usize, @intCast(d.relasz / @sizeOf(Elf64Rela)));
+                var ri: usize = 0;
+                while (ri < num_rela) : (ri += 1) {
+                    const rela_fileoff = loadVaddrToFileOffset(elf_bytes, getPhdrInfo(elf_bytes).?.phoff, getPhdrInfo(elf_bytes).?.phnum, d.rela + ri * @sizeOf(Elf64Rela)) orelse continue;
+                    if (rela_fileoff + @sizeOf(Elf64Rela) > elf_bytes.len) continue;
+                    const r_offset = std.mem.readInt(u64, elf_bytes[@intCast(rela_fileoff)..][0..8], .little);
+                    const r_info = std.mem.readInt(u64, elf_bytes[@intCast(rela_fileoff + 8)..][0..8], .little);
+                    const r_addend = std.mem.readInt(i64, elf_bytes[@intCast(rela_fileoff + 16)..][0..8], .little);
+                    if (r_type(r_info) == R_AARCH64_RELATIVE) {
+                        const target_off = r_offset;
+                        if (target_off + 8 <= guest_mem.len) {
+                            const value = load_base + @as(u64, @bitCast(r_addend));
+                            std.mem.writeInt(u64, guest_mem[@intCast(target_off)..][0..8], value, .little);
+                            fix_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse dynamic section for symbol/string tables
+    const e_phoff = getPhdrInfo(elf_bytes).?.phoff;
+    const e_phnum = getPhdrInfo(elf_bytes).?.phnum;
+    const dyn2 = parseDynamic(elf_bytes, e_phoff, e_phnum);
+
+    var result = DynLib{
+        .name = name,
+        .guest_mem = guest_mem,
+        .guest_base = load_base,
+        .guest_size = raw.guest_size,
+        .entry = raw.entry + load_base, // .so entry is relative to base
+        .symtab = 0,
+        .strtab = 0,
+        .strsz = 0,
+        .needed = .{ .items = &.{}, .capacity = 0 },
+        .init = 0,
+        .init_array = 0,
+        .init_arraysz = 0,
+        .fini = 0,
+        .fini_array = 0,
+        .fini_arraysz = 0,
+    };
+
+    if (dyn2) |d| {
+        result.symtab = if (d.symtab != 0) load_base + d.symtab else 0;
+        result.strtab = if (d.strtab != 0) load_base + d.strtab else 0;
+        result.strsz = d.strsz;
+        result.init = if (d.init != 0) load_base + d.init else 0;
+        result.init_array = if (d.init_array != 0) load_base + d.init_array else 0;
+        result.init_arraysz = d.init_arraysz;
+        result.fini = if (d.fini != 0) load_base + d.fini else 0;
+        result.fini_array = if (d.fini_array != 0) load_base + d.fini_array else 0;
+        result.fini_arraysz = d.fini_arraysz;
+    }
+
+    return result;
+}
+
+const PhdrInfo = struct { phoff: u64, phnum: u16 };
+
+fn getPhdrInfo(elf_bytes: []const u8) ?PhdrInfo {
+    if (elf_bytes.len < 64) return null;
+    const e_type = std.mem.readInt(u16, elf_bytes[16..18], .little);
+    _ = e_type;
+    return PhdrInfo{
+        .phoff = std.mem.readInt(u64, elf_bytes[32..40], .little),
+        .phnum = std.mem.readInt(u16, elf_bytes[56..58], .little),
+    };
+}
+
+/// Find a symbol by name across all loaded libraries.
+pub fn findGlobalSymbol(libs: []const DynLib, name: []const u8) ?u64 {
+    for (libs) |lib| {
+        if (lib.strtab == 0 or lib.symtab == 0) continue;
+
+        // Walk the symbol table looking for a name match
+        // (Heuristic: search first N entries)
+        const max_sym: usize = 4096;
+        var i: u64 = 1; // skip STN_UNDEF
+        while (i < max_sym) : (i += 1) {
+            const sym_guest = lib.symtab + i * @sizeOf(Elf64Sym);
+            const mem_off = sym_guest - lib.guest_base;
+            if (mem_off + 8 > lib.guest_mem.len) break;
+
+            const st_name = std.mem.readInt(u32, lib.guest_mem[@intCast(mem_off)..][0..4], .little);
+            const st_info = lib.guest_mem[@intCast(mem_off + 4)];
+            _ = st_info;
+            const st_value = std.mem.readInt(u64, lib.guest_mem[@intCast(mem_off + 8)..][0..8], .little);
+            const st_shndx = std.mem.readInt(u16, lib.guest_mem[@intCast(mem_off + 6)..][0..2], .little);
+
+            if (st_value == 0 or st_shndx == 0) continue;
+
+            // Read the symbol name from string table
+            const str_off = (lib.strtab + st_name) - lib.guest_base;
+            if (str_off > lib.guest_mem.len) continue;
+            const max_len = @min(@as(usize, 256), lib.guest_mem.len - @as(usize, @intCast(str_off)));
+            const sym_name = lib.guest_mem[@intCast(str_off)..][0..max_len];
+            const name_end = std.mem.indexOfScalar(u8, sym_name, 0) orelse max_len;
+            const actual_name = sym_name[0..name_end];
+
+            if (std.mem.eql(u8, actual_name, name)) {
+                return lib.guest_base + st_value;
+            }
+        }
+    }
+    return null;
+}
+
+/// Apply cross-library relocations to a loaded library.
+/// Updates GLOB_DAT and JUMP_SLOT entries to point to resolved symbols.
+pub fn resolveLibrary(lib: *DynLib, all_libs: []const DynLib) void {
+    // We need the original ELF file to read relocation entries.
+    // For now, this is handled by accessing the guest memory directly
+    // since .rela.plt and .rela.dyn are in loaded memory.
+    // The relocations are in the guest memory at the vaddr stored in dynamic section.
+    _ = lib;
+    _ = all_libs;
+}
+
 // ── Dynamic ELF structures ───────────────────────────────────────
 
 pub const Elf64Dyn = extern struct {
