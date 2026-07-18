@@ -12,6 +12,7 @@ const TranslationBlock = Block.TranslationBlock;
 const Cache = @import("cache.zig");
 const CodeCache = Cache.CodeCache;
 const Elf = @import("elf.zig");
+const RegAlloc = @import("regalloc.zig");
 
 const IRB = Ir.IRBuffer;
 const IROp = Ir.IROp;
@@ -146,7 +147,8 @@ pub const JitRuntime = struct {
         }
         const csize = estimateCodeSize(ir_buf.ops.items);
         const cpage = try runtime.cache.allocateCodePage(csize);
-        const emitted = Emit.emitBlock(cpage, &Emit.DefaultMapping, ir_buf.ops.items);
+        const regmap = RegAlloc.allocate(ir_buf.ops.items);
+        const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
         const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
         // Set chain info based on last opcode
