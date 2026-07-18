@@ -382,8 +382,10 @@ fn buildSbfm(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
 
 fn buildCSel(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.csel;
+    // Emit: mov rd, rm; cmovcc rd, rn
+    // CMOV uses x86 RFLAGS which reflects ARM64 NZCV after nzcv_read.
     try buf.append(allocator, .{ .tag = .nzcv_read, .dest = 0, .src0 = @intFromEnum(ops.cond), .src1 = 0, .flags = 0, .imm = 0 });
-    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 0, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{ .tag = .add_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = @intFromEnum(ops.cond), .imm = 0 });
 }
 
 fn buildCSinc(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {

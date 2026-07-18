@@ -102,11 +102,16 @@ fn threeOp(
 fn emitAdd(ctx: *EmitContext, op: IROp) void {
     const dst = mapReg(ctx.regmap, op.dest);
     const src0_is_xzr = isXzr(op.src0);
+    const cond = op.flags;
+
+    // If flags contains a condition code (CSEL), emit CMOV instead
+    if (cond != 0 and op.src1 != 0x1F and op.imm == 0) {
+        emitCSel(ctx, dst, mapReg(ctx.regmap, op.src0), mapReg(ctx.regmap, op.src1), cond);
+        return;
+    }
 
     if (op.imm != 0) {
-        // Immediate addition: MOV dst, imm or ADD dst, imm
         if (src0_is_xzr) {
-            // XZR + imm → MOV reg, imm (just zero + immediate)
             emitMovCst(ctx, dst, op.imm);
         } else {
             const src0 = mapReg(ctx.regmap, op.src0);
@@ -131,13 +136,42 @@ fn emitAdd(ctx: *EmitContext, op: IROp) void {
         ctx.byte(0x01);
         ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
     } else if (isXzr(op.dest)) {
-        // XZR + XZR → write to zero register → skip
     } else {
-        // Both operands are XZR → zero the destination
         ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(dst));
         ctx.byte(0x31);
         ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(dst));
     }
+}
+
+fn emitCSel(ctx: *EmitContext, dst: X86Reg, rn: X86Reg, rm: X86Reg, arm_cond: u16) void {
+    // ARM64 CSEL Xd, Xn, Xm, cond → Xd = cond ? Xn : Xm
+    // x86: MOV dst, rm; CMOVcc dst, rn (move false value first, overwrite if cond true)
+    // Map ARM64 condition → x86 CMOV opcode suffix
+    const cmov_suffix: u8 = switch (arm_cond & 0xF) {
+        0b0000 => 0x44, // EQ  → CMOVE
+        0b0001 => 0x45, // NE  → CMOVNE
+        0b0010 => 0x43, // CS/HS → CMOVAE (CF=0)
+        0b0011 => 0x42, // CC/LO → CMOVB  (CF=1)
+        0b0100 => 0x48, // MI  → CMOVS
+        0b0101 => 0x49, // PL  → CMOVNS
+        0b0110 => 0x40, // VS  → CMOVO
+        0b0111 => 0x41, // VC  → CMOVNO
+        0b1000 => 0x47, // HI  → CMOVA
+        0b1001 => 0x46, // LS  → CMOVBE
+        0b1010 => 0x4D, // GE  → CMOVGE
+        0b1011 => 0x4C, // LT  → CMOVL
+        0b1100 => 0x4F, // GT  → CMOVG
+        0b1101 => 0x4E, // LE  → CMOVLE
+        else  => 0x44,  // fallback to CMOVE
+    };
+
+    // MOV dst, rm (move false-case value)
+    emitMovReg(ctx, dst, rm);
+    // CMOVcc dst, rn (overwrite if condition true)
+    ctx.rex(true, @intFromEnum(rn), 0, @intFromEnum(dst));
+    ctx.byte(0x0F);
+    ctx.byte(cmov_suffix);
+    ctx.modrm(0b11, @intFromEnum(rn), @intFromEnum(dst));
 }
 
 fn emitSub(ctx: *EmitContext, op: IROp) void {
