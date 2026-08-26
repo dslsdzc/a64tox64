@@ -184,7 +184,6 @@ pub const DynLib = struct {
     symtab: u64,
     strtab: u64,
     strsz: u64,
-    needed: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
     init: u64,
     init_array: u64,
     init_arraysz: u64,
@@ -200,6 +199,12 @@ pub const DynLib = struct {
     tls_off: u64 = 0,
     tls_size: u64 = 0,
     tls_align: u64 = 0,
+    // NOTE: this default-valued field is deliberately LAST. The Zig 0.17
+    // self-hosted compiler this project pins mis-lays-out structs in some
+    // compilation contexts: fields AFTER a default-valued field get dropped
+    // (the struct is truncated at the first default). Keeping `needed` last
+    // ensures no other field can be lost.
+    needed: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
 };
 
 /// Load a dynamic library into guest memory and parse its metadata.

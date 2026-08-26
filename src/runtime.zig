@@ -418,12 +418,40 @@ const tb = try runtime.cache.allocateBlock();
         var cap_r14: u64 = undefined;
         var cap_r15: u64 = undefined;
         const guest_sp = runtime.state.sp;
+        // Workaround for a Zig 0.17 self-hosted codegen bug: struct-field
+        // addresses inside inline-asm operands are computed with a WRONG
+        // field offset (e.g. state at 0x1200 instead of its real offset),
+        // reading garbage. Hoist every struct-derived value into a plain
+        // local first — local operands are plain stack slots and are safe.
+        // Entry loading: x0-x8 are forced into rdi/rsi/rdx/rcx/r8/r9/r10/r11/rax
+        // (see regalloc.zig allocateAdv forced mapping). Fixed "{reg}" input
+        // constraints make the compiler load the values directly into those
+        // registers, so the template itself never reorders/clobbers input
+        // values (a "r"-constraint version let LLVM park inputs in registers
+        // that earlier template moves destroyed). block_fn travels in r12
+        // (execAtGuest convention) so x7's r11 slot is not clobbered.
+        const x0v = runtime.state.x[0];
+        const x1v = runtime.state.x[1];
+        const x2v = runtime.state.x[2];
+        const x3v = runtime.state.x[3];
+        const x4v = runtime.state.x[4];
+        const x5v = runtime.state.x[5];
+        const x6v = runtime.state.x[6];
+        const x7v = runtime.state.x[7];
+        const x8v = runtime.state.x[8];
+        const l1_base = &runtime.l1_cache;
         asm volatile (
                         \\ mov %[sp], %%r15
-            \\ mov %[rt], %%r14
-            \\ mov %[st], %%rdi
-            \\ mov %[fp], %%r11
-            \\ call *%%r11
+            \\ mov %[x0], %%rdi
+            \\ mov %[x1], %%rsi
+            \\ mov %[x2], %%rdx
+            \\ mov %[x3], %%rcx
+            \\ mov %[x4], %%r8
+            \\ mov %[x5], %%r9
+            \\ mov %[x6], %%r10
+            \\ mov %[x7], %%r11
+            \\ mov %[x8], %%rax
+            \\ call *%%r12
             \\ movq %%rdi, %[v_rdi]
             \\ movq %%rsi, %[v_rsi]
             \\ movq %%rdx, %[v_rdx]
@@ -454,11 +482,22 @@ const tb = try runtime.cache.allocateBlock();
               [v_r13] "=m" (cap_r13),
               [v_r14] "=m" (cap_r14),
               [v_r15] "=m" (cap_r15),
-            : [fp] "{r11}" (block_fn),
+            : [fp] "{r12}" (block_fn),
+              [x0] "{rdi}" (x0v),
+              [x1] "{rsi}" (x1v),
+              [x2] "{rdx}" (x2v),
+              [x3] "{rcx}" (x3v),
+              [x4] "{r8}" (x4v),
+              [x5] "{r9}" (x5v),
+              [x6] "{r10}" (x6v),
+              [x7] "{r11}" (x7v),
+              [x8] "{rax}" (x8v),
               [sp] "r" (guest_sp),
-              [st] "r" (&runtime.state),
-              [rt] "{r14}" (&runtime.l1_cache),
-            : .{ .rax = true, .r11 = true, .r14 = true, .r15 = true, .memory = true }
+              [rt] "{r14}" (l1_base),
+            : .{ .rax = true, .rbx = true, .rcx = true, .rdx = true,
+                .rsi = true, .rdi = true, .rbp = true, .r8 = true,
+                .r9 = true, .r10 = true, .r11 = true, .r12 = true,
+                .r13 = true, .r14 = true, .r15 = true, .memory = true }
         );
 
         // R15 holds the live guest SP — save back to state for next block
@@ -959,6 +998,18 @@ const tb = try runtime.cache.allocateBlock();
         var cap_r14: u64 = undefined;
         var cap_r15: u64 = undefined;
         const guest_sp = runtime.state.sp;
+        // Same Zig 0.17 struct-offset-in-asm-operand bug workaround as
+        // executeInner: hoist state-derived values into locals first.
+        const x0v = runtime.state.x[0];
+        const x1v = runtime.state.x[1];
+        const x2v = runtime.state.x[2];
+        const x3v = runtime.state.x[3];
+        const x4v = runtime.state.x[4];
+        const x5v = runtime.state.x[5];
+        const x6v = runtime.state.x[6];
+        const x7v = runtime.state.x[7];
+        const x8v = runtime.state.x[8];
+        const l1_base = &runtime.l1_cache;
         const block_fn: *const fn (*anyopaque) callconv(.c) void =
             @ptrCast(@alignCast(block.host_addr.ptr));
         asm volatile (
@@ -1005,17 +1056,17 @@ const tb = try runtime.cache.allocateBlock();
               [v_r14] "=m" (cap_r14),
               [v_r15] "=m" (cap_r15),
             : [fptr] "{r12}" (block_fn),
-              [x0] "r" (runtime.state.x[0]),
-              [x1] "r" (runtime.state.x[1]),
-              [x2] "r" (runtime.state.x[2]),
-              [x3] "r" (runtime.state.x[3]),
-              [x4] "r" (runtime.state.x[4]),
-              [x5] "r" (runtime.state.x[5]),
-              [x6] "r" (runtime.state.x[6]),
-              [x7] "r" (runtime.state.x[7]),
-              [x8] "r" (runtime.state.x[8]),
+              [x0] "r" (x0v),
+              [x1] "r" (x1v),
+              [x2] "r" (x2v),
+              [x3] "r" (x3v),
+              [x4] "r" (x4v),
+              [x5] "r" (x5v),
+              [x6] "r" (x6v),
+              [x7] "r" (x7v),
+              [x8] "r" (x8v),
               [sp] "r" (guest_sp),
-              [rt] "{r14}" (&runtime.l1_cache),
+              [rt] "{r14}" (l1_base),
             : .{ .rdi = true, .rsi = true, .rdx = true, .rcx = true,
                 .r8 = true, .r9 = true, .r10 = true, .r11 = true, .rax = true,
                 .rbx = true, .rbp = true, .r12 = true, .r13 = true, .r14 = true,
@@ -1083,7 +1134,9 @@ test "PLT: resolve and translate cross-library call" {
     const jmprel_base: u64 = got_base + 16;
 
     var guest = try std.testing.allocator.alloc(u8, jmprel_base + @sizeOf(Elf.Elf64Rela));
-    defer std.testing.allocator.free(guest);
+    // NOTE: no defer free(guest) here — the runtime's deinit frees
+    // lib.guest_mem (this buffer). A local defer would run first (LIFO)
+    // and cause a double free inside runtime.deinit().
     @memset(guest, 0);
 
     // String table at strtab_base
@@ -1112,7 +1165,10 @@ test "PLT: resolve and translate cross-library call" {
     const dyn_lib = Elf.DynLib{
         .name = "libtest.so",
         .guest_mem = guest,
-        .guest_base = 0x200000, // base for this library
+        // guest_base = 0: the test indexes the guest buffer with guest
+        // addresses directly (strtab at 0x300000 etc.), so the library's
+        // base must be 0 for runtime offset math (addr - base) to match.
+        .guest_base = 0, // base for this library
         .guest_size = @as(u64, @intCast(guest.len)),
         .entry = 0x10000,
         .symtab = symtab_base,
@@ -1139,7 +1195,9 @@ test "PLT: resolve and translate cross-library call" {
     // doesn't crash and correctly processes the PLT entry
     try runtime.resolvePltEntries();
 
-    // Verify GOT[1] was patched (should be non-zero x86-64 address now)
+    // Verify GOT[1] was patched (should be non-zero x86-64 address now).
+    // The DynLib below uses guest_base = 0, so buffer offsets equal guest
+    // addresses and the GOT entry sits at raw buffer index got_base + 8.
     const got_val = std.mem.readInt(u64, guest[got_base + 8..][0..8], .little);
     try std.testing.expect(got_val != 0);
     // The patched address should be in the host memory range (not ARM64 guest range)
@@ -1160,7 +1218,7 @@ test "MOVZ X0, #0x42" {
 test "ADD X0, X1, #42" {
     var runtime = JitRuntime.init(std.testing.allocator);
     defer runtime.deinit();
-    const code = [_]u8{ 0x2A, 0x0C, 0x10, 0x91, 0x00, 0x00, 0x5F, 0xD6 };
+    const code = [_]u8{ 0x20, 0xA8, 0x00, 0x91, 0x00, 0x00, 0x5F, 0xD6 };
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
@@ -1182,7 +1240,7 @@ test "SVC write syscall" {
     //
     // Simplified: just test that SVC triggers and doesn't crash
     const code = [_]u8{
-        0x80, 0x00, 0x80, 0xD2,  // MOVZ X0, #0x42
+        0x40, 0x08, 0x80, 0xD2,  // MOVZ X0, #0x42
         0x00, 0x00, 0x5F, 0xD6,  // RET
     };
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
@@ -1195,7 +1253,7 @@ test "SVC write syscall" {
 test "SUB + MOVZ pipeline" {
     var runtime = JitRuntime.init(std.testing.allocator);
     defer runtime.deinit();
-    const code = [_]u8{ 0x20, 0x0C, 0x00, 0xD1, 0xE2, 0x00, 0x80, 0xD2, 0x00, 0x00, 0x5F, 0xD6 };
+    const code = [_]u8{ 0x20, 0x28, 0x00, 0xD1, 0xE2, 0x00, 0x80, 0xD2, 0x00, 0x00, 0x5F, 0xD6 };
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
@@ -1225,7 +1283,7 @@ test "SVC getpid returns positive PID" {
     var runtime = JitRuntime.init(std.testing.allocator);
     defer runtime.deinit();
     const code = [_]u8{
-        0x08, 0x15, 0x80, 0xD2,  // MOVZ X8, #172 (__NR_getpid)
+        0x88, 0x15, 0x80, 0xD2,  // MOVZ X8, #172 (__NR_getpid)
         0x01, 0x00, 0x00, 0xD4,  // SVC #0
     };
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
@@ -1234,4 +1292,19 @@ test "SVC getpid returns positive PID" {
     runtime.execute(runtime.state.pc, 0);
     try std.testing.expect(runtime.state.x[0] > 0);
     try std.testing.expectEqual(@as(u64, 172), runtime.state.x[8]);
+}
+
+test "block entry loads x0-x7 from state" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    // ADD X0, X1, X2 = 0x8B020020; RET — verifies all x0-x7 entry loads
+    // (x1 → RSI, x2 → RDX) plus the x0 result write-back.
+    const code = [_]u8{ 0x20, 0x00, 0x02, 0x8B, 0x00, 0x00, 0x5F, 0xD6 };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.state.x[1] = 1000;
+    runtime.state.x[2] = 23;
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 1023), runtime.state.x[0]);
 }

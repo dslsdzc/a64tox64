@@ -43,6 +43,23 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         m.* = if (i == 8) @as(?X86Reg, .rax) else null;
     }
 
+    // Forced mapping: guest x0-x7 → rdi/rsi/rdx/rcx/r8/r9/r10/r11, x8 → rax.
+    // Matches DefaultMapping and the entry loading in execAtGuest/executeInner,
+    // so every block starts with x0-x8 in known host registers. These hosts
+    // are removed from the candidate pool before hint/frequency allocation,
+    // so no other ARM register can steal them.
+    const forced_x = [_]X86Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11 };
+    var used_hosts = std.mem.zeroes([16]bool);
+    var hint_arm = std.mem.zeroes([31]bool);
+    for (forced_x, 0..) |reg, arm_i| {
+        mapping[arm_i] = reg;
+        used_hosts[@intFromEnum(reg)] = true;
+        hint_arm[arm_i] = true;
+    }
+    mapping[8] = .rax;
+    used_hosts[@intFromEnum(X86Reg.rax)] = true;
+    hint_arm[8] = true;
+
     // Score computation: each ARM register referenced in ops gets a score
     // based on its usage frequency (weighted by hotness). ARM registers are
     // then sorted by score descending and allocated to host registers in that
@@ -65,8 +82,6 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
     }
 
     // Strong hints: reserve preferred host regs before frequency assignment
-    var used_hosts = std.mem.zeroes([16]bool);
-    var hint_arm = std.mem.zeroes([31]bool);
     if (hints) |h| {
         for (h.pref, 0..) |maybe_reg, arm_i| {
             if (maybe_reg) |reg| {
@@ -79,6 +94,14 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
             }
         }
     }
+
+    // Re-assert forced mapping (hints could not have overwritten it since the
+    // forced hosts are already used, but this guards against stale hint data
+    // pointing x0-x8 at a free non-forced register).
+    for (forced_x, 0..) |reg, arm_i| {
+        mapping[arm_i] = reg;
+    }
+    mapping[8] = .rax;
 
     // Sort by frequency
     var sorted: [31]usize = undefined;

@@ -24,7 +24,11 @@ pub const CodeCache = struct {
     pub fn deinit(cache: *CodeCache) void {
         for (cache.blocks.items) |b| cache.allocator.destroy(b);
         cache.blocks.deinit(cache.allocator);
-        for (cache.pages.items) |page| cache.allocator.free(page);
+        // Code pages come from std.posix.mmap (allocateCodePage), not the
+        // heap allocator — freeing them via allocator.free panics in
+        // SafeAllocator ("free of invalid memory") and leaks/mis-frees
+        // otherwise. munmap them instead.
+        for (cache.pages.items) |page| std.posix.munmap(@alignCast(page));
         cache.pages.deinit(cache.allocator);
         cache.map.deinit();
     }
