@@ -195,16 +195,18 @@ pub const DynLib = struct {
     relasz: u64,
     jmprel: u64,
     pltrelsz: u64,
+    // NOTE: this default-valued field is deliberately placed BEFORE the other
+    // default-valued fields (tls_off/tls_size/tls_align). The Zig 0.17
+    // self-hosted compiler this project pins mis-lays-out structs in some
+    // compilation contexts: fields AFTER a default-valued field get dropped
+    // (the struct is truncated at the first default). `needed` is populated at
+    // runtime from DT_NEEDED (loadDynLib), so it must not be lost — placing it
+    // before any default-valued field ensures the workaround covers it.
+    needed: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
     // TLS info (0 if no TLS segment)
     tls_off: u64 = 0,
     tls_size: u64 = 0,
     tls_align: u64 = 0,
-    // NOTE: this default-valued field is deliberately LAST. The Zig 0.17
-    // self-hosted compiler this project pins mis-lays-out structs in some
-    // compilation contexts: fields AFTER a default-valued field get dropped
-    // (the struct is truncated at the first default). Keeping `needed` last
-    // ensures no other field can be lost.
-    needed: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
 };
 
 /// Load a dynamic library into guest memory and parse its metadata.
