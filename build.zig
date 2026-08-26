@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_module,
     });
 
+    const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run all unit tests");
-    test_step.dependOn(&unit_tests.step);
+    test_step.dependOn(&run_tests.step);
 }

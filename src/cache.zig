@@ -7,6 +7,7 @@ const TranslationBlock = Block.TranslationBlock;
 pub const CodeCache = struct {
     allocator: std.mem.Allocator,
     map: std.AutoHashMap(u64, *TranslationBlock),
+    blocks: std.ArrayListUnmanaged(*TranslationBlock) = .{ .items = &.{}, .capacity = 0 },
     pages: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
     generation: u32,
 
@@ -14,15 +15,16 @@ pub const CodeCache = struct {
         return .{
             .allocator = allocator,
             .map = std.AutoHashMap(u64, *TranslationBlock).init(allocator),
+            .blocks = .{ .items = &.{}, .capacity = 0 },
             .pages = .{ .items = &.{}, .capacity = 0 },
             .generation = 0,
         };
     }
 
     pub fn deinit(cache: *CodeCache) void {
-        for (cache.pages.items) |page| {
-            cache.allocator.free(page);
-        }
+        for (cache.blocks.items) |b| cache.allocator.destroy(b);
+        cache.blocks.deinit(cache.allocator);
+        for (cache.pages.items) |page| cache.allocator.free(page);
         cache.pages.deinit(cache.allocator);
         cache.map.deinit();
     }
@@ -38,6 +40,7 @@ pub const CodeCache = struct {
     pub fn allocateBlock(cache: *CodeCache) !*TranslationBlock {
         const block = try cache.allocator.create(TranslationBlock);
         block.* = TranslationBlock.init(0, &.{});
+        try cache.blocks.append(cache.allocator, block);
         return block;
     }
 
