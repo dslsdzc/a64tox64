@@ -14,11 +14,26 @@ const CodeCache = Cache.CodeCache;
 const Elf = @import("elf.zig");
 const RegAlloc = @import("regalloc.zig");
 const Thunk = @import("thunk.zig");
+const LlvmBackend = @import("llvm_backend.zig");
+const Signal = @import("signal.zig");
+const GdbJit = @import("gdbjit.zig");
+
+// Dynamic linker (dlopen/dlsym) for host library thunking
+extern fn dlopen(filename: [*:0]const u8, flags: i32) ?*anyopaque;
+extern fn dlsym(handle: *anyopaque, name: [*:0]const u8) ?*anyopaque;
 
 const IRB = Ir.IRBuffer;
 const IROp = Ir.IROp;
 
+pub const L1_SIZE = 64;
+pub const L1Entry = struct { guest_pc: u64, host_addr: u64 };
+
 const MAX_BLOCK_INSTRS: u32 = 64;
+const L2_SIZE = 256;
+const L2Entry = struct { guest_pc: u64, host_addr: u64 };
+
+const MAX_SIGNAL_HANDLERS = 32;
+const SignalAction = struct { handler: u64, mask: u64, flags: u32 };
 
 pub const JitRuntime = struct {
     allocator: std.mem.Allocator,
@@ -36,6 +51,15 @@ pub const JitRuntime = struct {
     pending_hints_scores: [31]usize,
     has_pending_hints: bool,
     loaded_libs: std.ArrayListUnmanaged(Elf.DynLib),
+    host_libs: std.StringHashMapUnmanaged(*anyopaque) = .{},
+    thunk_page: ?[]align(4096) u8 = null,
+    thunk_page_offset: usize = 0,
+
+    /// Written by emitted code on L1 miss: non-zero means indirect branch.
+    indirect_target: u64 = 0,
+    guest_sigactions: [MAX_SIGNAL_HANDLERS]SignalAction = undefined,
+    l1_cache: [64]L1Entry align(16) = undefined,
+    l2_cache: [L2_SIZE]L2Entry align(64) = undefined,
 
     pub fn init(allocator: std.mem.Allocator) JitRuntime {
         var rt = JitRuntime{
@@ -50,6 +74,7 @@ pub const JitRuntime = struct {
             .last_block_was_svc = false,
             .last_block_next_pc = 0,
             .last_block_pc = 0,
+            .host_libs = .{},
             .pending_hints_pref = undefined,
             .pending_hints_scores = undefined,
             .has_pending_hints = false,
@@ -68,6 +93,16 @@ pub const JitRuntime = struct {
         rt.trampoline = tramp_page[0..emitted.len];
         @memset(&rt.pending_hints_pref, null);
         @memset(&rt.pending_hints_scores, 0);
+        @memset(@as(*[64]L1Entry, @ptrCast(&rt.l1_cache)), L1Entry{ .guest_pc = 0, .host_addr = 0 });
+        @memset(@as(*[L2_SIZE]L2Entry, @ptrCast(&rt.l2_cache)), L2Entry{ .guest_pc = 0, .host_addr = 0 });
+        @memset(&rt.guest_sigactions, SignalAction{ .handler = 0, .mask = 0, .flags = 0 });
+        LlvmBackend.init(allocator) catch {
+            std.log.warn("LLVM backend init failed — using hand-written emitter only", .{});
+        };
+        Signal.setup(&rt.cache) catch {
+            std.log.warn("Signal handler setup failed", .{});
+        };
+        GdbJit.init();
         return rt;
     }
 
@@ -88,33 +123,39 @@ pub const JitRuntime = struct {
             lib.needed.deinit(runtime.allocator);
         }
         runtime.loaded_libs.deinit(runtime.allocator);
+        var hli = runtime.host_libs.iterator();
+        while (hli.next()) |entry| runtime.allocator.free(entry.key_ptr.*);
+        runtime.host_libs.deinit(runtime.allocator);
+        if (runtime.thunk_page) |p| std.posix.munmap(p);
+        LlvmBackend.deinit();
     }
 
     pub fn loadElf(runtime: *JitRuntime, elf_bytes: []const u8) !void {
         const loaded = try Elf.loadElf(runtime.allocator, elf_bytes);
         runtime.guest_base = loaded.guest_base;
         const psize = std.mem.alignForward(usize, loaded.guest_mem.len, @as(usize, 4096));
+        const map_base = loaded.guest_base & ~@as(u64, 0xFFF);
         const guest_page = try std.posix.mmap(
-            null, psize,
+            @ptrFromInt(map_base), psize,
             std.posix.PROT{ .READ = true, .WRITE = true },
-            std.posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            std.posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
             -1, 0,
         );
-        @memcpy(guest_page[0..loaded.guest_mem.len], loaded.guest_mem);
+        @memcpy(@as([*]u8, @ptrCast(guest_page))[0..loaded.guest_mem.len], loaded.guest_mem);
         runtime.allocator.free(loaded.guest_mem);
-        runtime.guest_mem = guest_page[0..loaded.guest_mem.len];
-        runtime.guest_mem_mmap = guest_page;
+        runtime.guest_mem = @as([*]u8, @ptrCast(guest_page))[0..loaded.guest_mem.len];
+        runtime.guest_mem_mmap = @as([]align(4096) u8, @alignCast(@as([*]u8, @ptrCast(guest_page))[0..psize]));
+        Signal.setupGuestMem(map_base, psize);
         runtime.state.pc = loaded.entry;
-        std.log.debug("base=0x{X} entry=0x{X} mem_len={}", .{runtime.guest_base, runtime.state.pc, runtime.guest_mem.?.len});
-        // Set up guest stack
+        const guest_stack_size: usize = 1024 * 1024;
         const stack_page = try std.posix.mmap(
-            null, 1024 * 1024,
+            null, guest_stack_size,
             std.posix.PROT{ .READ = true, .WRITE = true },
             std.posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true },
             -1, 0,
         );
         runtime.guest_stack = stack_page;
-        runtime.state.sp = @intFromPtr(stack_page.ptr) + 1024 * 1024;
+        runtime.state.sp = @intFromPtr(stack_page.ptr) + guest_stack_size - 4096;
 
         // Handle dynamic linking if present
         const e_phoff = std.mem.readInt(u64, elf_bytes[32..40], .little);
@@ -124,11 +165,6 @@ pub const JitRuntime = struct {
         }
     }
 
-    fn readGuestU32(runtime: *JitRuntime, addr: u64) u32 {
-        const mem = runtime.guest_mem orelse @panic("guest memory not set");
-        const offset = addr - runtime.guest_base;
-        return std.mem.readInt(u32, mem[@intCast(offset)..][0..4], .little);
-    }
 
     fn isBlockEnd(opcode: Decode.Opcode) bool {
         return switch (opcode) {
@@ -141,55 +177,121 @@ pub const JitRuntime = struct {
         return ops.len * 32 + 64;
     }
 
-    pub fn translateBlock(runtime: *JitRuntime, guest_pc: u64) !*TranslationBlock {
+    pub fn translateBlock(runtime: *JitRuntime, guest_pc: u64, depth: u32) !*TranslationBlock {
+        if (depth > 64) return error.MaxDepth;
+        // Merge up to 4 consecutive direct-branch blocks into one region
+        // to reduce block-boundary save/restore overhead.
+        return runtime.translateRegion(guest_pc, 4, depth);
+    }
+
+    /// Translate a region of one or more basic blocks.
+    /// When region_depth > 1, consecutive direct branches (B) are inlined
+    /// into the same IR buffer, reducing block-boundary save/restore overhead.
+    /// Conditional branches, calls, and indirect branches still end the region.
+    fn translateRegion(runtime: *JitRuntime, guest_pc: u64, max_depth: u32, depth: u32) !*TranslationBlock {
+        if (depth > 64) return error.MaxDepth;
+        const MAX_BLOCK_INSTRS_PER_REGION: u32 = MAX_BLOCK_INSTRS * 4;
         var ir_buf: IRB = .{};
         defer ir_buf.deinit(runtime.allocator);
+
+        // Cache guest memory pointer locally to avoid repeated struct dereference
+        const guest_mem_local = runtime.guest_mem orelse @panic("guest memory not set");
+        const guest_base_local = runtime.guest_base;
+
         var pc = guest_pc;
         var count: u32 = 0;
         var ends_with_svc = false;
         var last_opcode: Decode.Opcode = .unknown;
         var last_target: u64 = 0;
-        while (count < MAX_BLOCK_INSTRS) {
-            const raw = runtime.readGuestU32(pc);
+        var block_depth: u32 = 0;
+
+        while (count < MAX_BLOCK_INSTRS_PER_REGION) {
+            const offset = pc - guest_base_local;
+            const raw = std.mem.readInt(u32, guest_mem_local[@intCast(offset)..][0..4], .little);
             const decoded = Decode.decode(raw);
-            // Track last opcode and branch target for chain detection
-            last_opcode = decoded.opcode;
-            if (decoded.opcode == .b or decoded.opcode == .bl) {
+            const cur_opcode = decoded.opcode;
+
+            // Check if this is a block boundary
+            if (cur_opcode == .b or cur_opcode == .bl) {
                 // B/BL: imm26 at bits 25-0, sign-extended << 2
                 const imm26: i64 = @as(i64, @as(i26, @bitCast(@as(u26, @truncate(raw & 0x03FFFFFF)))));
                 last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm26 << 2)));
-            } else if (decoded.opcode == .b_cond) {
-                // B.cond: imm19 at bits 23-5, sign-extended << 2
+            } else if (cur_opcode == .b_cond) {
                 const imm19: i64 = @as(i64, @as(i19, @bitCast(@as(u19, @truncate((raw >> 5) & 0x7FFFF)))));
                 last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm19 << 2)));
             }
+
+            // Build IR for this instruction
             try IrB.build(&ir_buf, runtime.allocator, decoded, pc);
             count += 1;
             pc += 4;
-            if (decoded.opcode == .svc) ends_with_svc = true;
-            if (isBlockEnd(decoded.opcode)) break;
+
+            // Track the LAST block-ending opcode for chain detection
+            if (isBlockEnd(cur_opcode)) {
+                last_opcode = cur_opcode;
+                if (cur_opcode == .svc) ends_with_svc = true;
+            }
+
+            // Decide whether to continue the region or stop
+            if (isBlockEnd(cur_opcode)) {
+                if (cur_opcode == .b and block_depth + 1 < max_depth) {
+                    // Direct branch (B) to known target — inline the target
+                    // region by continuing the decode loop at the target PC.
+                    // The terminal BR op is NOT emitted — control flows into
+                    // the target block's code naturally.
+                    block_depth += 1;
+                    pc = last_target;
+                    // Remove the last IR op (the BR) since we're inlining the target
+                    if (ir_buf.ops.items.len > 0 and ir_buf.ops.items[ir_buf.ops.items.len - 1].tag == .br) {
+                        _ = ir_buf.ops.pop();
+                    }
+                    continue;
+                }
+                // For BL, B.cond, BR, RET, SVC: end the region here
+                break;
+            }
         }
+        if (count == 0) return error.EmptyRegion;
+        // Decide backend: LLVM for blocks with x14+ regs or SIMD ops;
+        // hand-written emitter for the common case.
+        const use_llvm = LlvmBackend.shouldUseLlvm(ir_buf.ops.items);
+
+        if (use_llvm) {
+            if (LlvmBackend.compileBlock(ir_buf.ops.items, guest_pc)) |code| {
+                const tb = try runtime.cache.allocateBlock();
+                tb.* = TranslationBlock.init(guest_pc, code);
+                tb.regmap = Emit.RegisterMap{ null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null }; // LLVM stores state internally
+                tb.chain_type = switch (last_opcode) {
+                    .b => .direct,
+                    .b_cond => .cond,
+                    .bl => .call,
+                    else => .none,
+                };
+                tb.chain_target = last_target;
+                tb.fallthrough_pc = pc;
+                try runtime.cache.insert(tb);
+                Signal.registerBlock(tb.host_addr, tb.guest_pc);
+                GdbJit.addBlock(@intFromPtr(tb.host_addr.ptr), tb.host_addr.len, tb.guest_pc);
+                runtime.last_block_was_svc = ends_with_svc;
+                runtime.last_block_next_pc = pc;
+                return tb;
+            }
+        }
+
+        // Fallback: hand-written x86-64 emitter
         const csize = estimateCodeSize(ir_buf.ops.items);
         const cpage = try runtime.cache.allocateCodePage(csize);
 
-        // Per-block register allocation with hotness and predecessor hints.
-        // State-loading prologue ensures consistent cross-block values.
-        const hotness: f32 = if (runtime.last_block_pc > guest_pc) 2.0 else 1.0;
-        const maybe_hints: ?RegAlloc.RegHints = if (runtime.has_pending_hints) h: {
-            break :h RegAlloc.RegHints{
-                .pref = runtime.pending_hints_pref,
-                .scores = runtime.pending_hints_scores,
-            };
-        } else null;
-        const regmap = RegAlloc.allocateAdv(ir_buf.ops.items, hotness,
-            if (maybe_hints) |*h| h else null);
-        runtime.has_pending_hints = false;
-        runtime.last_block_pc = 0; // consumed
-
+        const regmap = a: {
+            if (runtime.has_pending_hints) {
+                var hints: RegAlloc.RegHints = undefined;
+                hints.pref = runtime.pending_hints_pref;
+                hints.scores = runtime.pending_hints_scores;
+                break :a RegAlloc.allocateAdv(ir_buf.ops.items, 1.0, &hints);
+            }
+            break :a RegAlloc.allocateAdv(ir_buf.ops.items, 1.0, null);
+        };
         const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
-        if (emitted.len >= 10 and emitted[0] == 0x49 and emitted[1] == 0xBE) {
-            std.mem.writeInt(u64, emitted[2..10], @intFromPtr(&runtime.state), .little);
-        }
 const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
         tb.regmap = regmap;
@@ -202,12 +304,13 @@ const tb = try runtime.cache.allocateBlock();
         tb.chain_target = last_target;
         tb.fallthrough_pc = pc;
         try runtime.cache.insert(tb);
+        Signal.registerBlock(tb.host_addr, tb.guest_pc);
 
         // Hardware chaining: patch JMP/CALL placeholders if target already translated
         if (emitted.len >= 6 and last_opcode != .ret_ and last_opcode != .svc) {
             const branch_kind: enum { jmp, jcc, call, none } = brk: {
                 // JMP (E9 rel32) — 5 bytes at end: E9 xx xx xx xx
-                if (emitted.len >= 5 and emitted[emitted.len - 6] == 0xE9) break :brk .jmp; if (emitted.len >= 6) 
+                if (emitted.len >= 5 and emitted[emitted.len - 5] == 0xE9) break :brk .jmp;
                 // CALL+RET (E8 rel32 C3) — 6 bytes: E8 xx xx xx xx C3
                 if (emitted.len >= 6 and emitted[emitted.len - 6] == 0xE8 and emitted[emitted.len - 1] == 0xC3) break :brk .call;
                 // JCC (0F 8x rel32) — 6 bytes: 0F 8x xx xx xx xx
@@ -240,23 +343,65 @@ const tb = try runtime.cache.allocateBlock();
         return tb;
     }
 
-    pub fn execute(runtime: *JitRuntime, guest_pc: u64) void {
-        const block = runtime.cache.lookup(guest_pc) orelse blk: {
-            break :blk runtime.translateBlock(guest_pc) catch {
-                std.log.err("translateBlock failed at PC 0x{X:016}", .{guest_pc});
-                return;
+    pub fn execute(runtime: *JitRuntime, guest_pc: u64, depth: u32) void {
+        // Thin public wrapper to avoid the Zig 0.17 R9-init compiler bug
+        // in the recursive executeInner function.
+        runtime.executeInner(guest_pc, depth);
+    }
+
+    fn executeInner(runtime: *JitRuntime, guest_pc: u64, depth: u32) void {
+        if (depth > 64) return;
+
+        // Check for pending signal from signal.zig handler
+        if (Signal.pending_signal >= 0) {
+            const sig = @as(usize, @intCast(Signal.pending_signal));
+            Signal.pending_signal = -1;
+            if (sig < MAX_SIGNAL_HANDLERS) {
+                const handler = runtime.guest_sigactions[sig].handler;
+                if (handler != 0) {
+                    runtime.executeInner(handler, depth + 1);
+                    return;
+                }
+            }
+        }
+
+        const block = blk: {
+            // Check L2 cache before full HashMap lookup
+            const l2_h = (guest_pc >> 2) & (L2_SIZE - 1);
+            const l2e = runtime.l2_cache[l2_h];
+            if (l2e.guest_pc == guest_pc) {
+                break :blk @as(*TranslationBlock, @ptrCast(@alignCast(@as(*anyopaque, @ptrFromInt(l2e.host_addr)))));
+            }
+            break :blk runtime.cache.lookup(guest_pc) orelse hmap: {
+                break :hmap runtime.translateBlock(guest_pc, depth) catch {
+                    std.log.err("translateBlock failed at PC 0x{X:016}", .{guest_pc});
+                    return;
+                };
             };
         };
 
-        const block_fn: *const fn () callconv(.c) void =
+        const block_fn: *const fn (*anyopaque) callconv(.c) void =
             @ptrCast(@alignCast(block.host_addr.ptr));
         if (@intFromPtr(block_fn) < 0x10000) {
             std.debug.print("CRASH: block_fn near null! pc=0x{X} fn=0x{X}\n", .{guest_pc, @intFromPtr(block_fn)});
         }
-        // Call block and capture all register values in a SINGLE asm block.
-        // Uses "=m" constraints to store register values directly to local variables,
-        // avoiding Zig's one-output limitation and the register-alias bug where
-        // multiple "=r" outputs silently share the same register.
+
+        // Update L1 and L2 caches for this block
+        const l1_hash = (guest_pc >> 2) & (L1_SIZE - 1);
+        runtime.l1_cache[l1_hash] = .{
+            .guest_pc = guest_pc,
+            .host_addr = @intFromPtr(block.host_addr.ptr),
+        };
+        const l2_hash = (guest_pc >> 2) & (L2_SIZE - 1);
+        runtime.l2_cache[l2_hash] = .{ .guest_pc = guest_pc, .host_addr = @intFromPtr(block) };
+        // LLVM blocks (regmap[0]==null): direct Zig call avoids inline asm
+        // register-allocation interference with the state pointer argument.
+        // Hand-emitter blocks: inline asm captures all host registers.
+        runtime.indirect_target = 0;
+        if (block.regmap[0] == null) {
+            const fn2: *const fn (*anyopaque, u64) callconv(.c) void = @ptrCast(@alignCast(block.host_addr.ptr));
+            fn2(&runtime.state, runtime.state.sp);
+        } else {
         var cap_rdi: u64 = undefined;
         var cap_rsi: u64 = undefined;
         var cap_rdx: u64 = undefined;
@@ -275,6 +420,8 @@ const tb = try runtime.cache.allocateBlock();
         const guest_sp = runtime.state.sp;
         asm volatile (
                         \\ mov %[sp], %%r15
+            \\ mov %[rt], %%r14
+            \\ mov %[st], %%rdi
             \\ mov %[fp], %%r11
             \\ call *%%r11
             \\ movq %%rdi, %[v_rdi]
@@ -310,26 +457,24 @@ const tb = try runtime.cache.allocateBlock();
             : [fp] "{r11}" (block_fn),
               [sp] "r" (guest_sp),
               [st] "r" (&runtime.state),
-              // Load guest state: {reg} constraints set each register before asm
-            : .{ .rax = true, .r11 = true, .r15 = true, .memory = true }
+              [rt] "{r14}" (&runtime.l1_cache),
+            : .{ .rax = true, .r11 = true, .r14 = true, .r15 = true, .memory = true }
         );
 
-        // R15 holds the live guest SP — save it back to state for next block
-        runtime.state.sp = cap_r15;
-
-        // Copy captured values to guest state using the block's register map.
-        // The per-block allocator may assign ARM64 registers to different host
-        // registers than the DefaultMapping — we must route via the stored regmap.
-        for (block.regmap, 0..) |maybe_host, arm_i| {
-            const val = if (maybe_host) |host| switch (host) {
-                .rdi => cap_rdi, .rsi => cap_rsi, .rdx => cap_rdx,
-                .rcx => cap_rcx, .r8  => cap_r8,  .r9  => cap_r9,
-                .r10 => cap_r10, .r11 => cap_r11, .rax => cap_rax,
-                .rbx => cap_rbx, .rbp => cap_rbp, .r12 => cap_r12,
-                .r13 => cap_r13, .r14 => cap_r14, .r15 => cap_r15,
-                .rsp => unreachable,
-            } else continue;
-            runtime.state.x[arm_i] = val;
+        // R15 holds the live guest SP — save back to state for next block
+        // LLVM blocks save state themselves (compileBlock store-back).
+            runtime.state.sp = cap_r15;
+            for (block.regmap, 0..) |maybe_host, arm_i| {
+                const val = if (maybe_host) |host| switch (host) {
+                    .rdi => cap_rdi, .rsi => cap_rsi, .rdx => cap_rdx,
+                    .rcx => cap_rcx, .r8  => cap_r8,  .r9  => cap_r9,
+                    .r10 => cap_r10, .r11 => cap_r11, .rax => cap_rax,
+                    .rbx => cap_rbx, .rbp => cap_rbp, .r12 => cap_r12,
+                    .r13 => cap_r13, .r14 => cap_r14, .r15 => cap_r15,
+                    .rsp => unreachable,
+                } else continue;
+                runtime.state.x[arm_i] = val;
+            }
         }
 
         // Track execution count for hotness profiling
@@ -344,7 +489,7 @@ const tb = try runtime.cache.allocateBlock();
         if (!runtime.last_block_was_svc and block.chain_type == .direct) {
             runtime.storeHints(exit_hints);
             runtime.last_block_pc = block.guest_pc;
-            runtime.execute(block.chain_target);
+            runtime.executeInner(block.chain_target, depth + 1);
             return;
         }
         // BL (call): ensure target is translated, then recursively execute it.
@@ -355,7 +500,7 @@ const tb = try runtime.cache.allocateBlock();
         if (!runtime.last_block_was_svc and block.chain_type == .call) {
             runtime.storeHints(exit_hints);
             runtime.last_block_pc = block.guest_pc;
-            runtime.execute(block.chain_target);
+            runtime.executeInner(block.chain_target, depth + 1);
             return;
         }
         // SVC or indirect: handle normally
@@ -365,33 +510,21 @@ const tb = try runtime.cache.allocateBlock();
             runtime.last_block_pc = block.guest_pc;
             runtime.last_block_was_svc = false;
             handleSyscall(runtime);
-            runtime.execute(runtime.last_block_next_pc);
+            runtime.executeInner(runtime.last_block_next_pc, depth + 1);
+            return;
+        }
+        // Indirect branch (BR/BLR): the block stored the target in
+        // runtime.indirect_target. Look up or translate and dispatch.
+        if (runtime.indirect_target != 0) {
+            const target = runtime.indirect_target;
+            runtime.indirect_target = 0;
+            runtime.storeHints(exit_hints);
+            runtime.last_block_pc = block.guest_pc;
+            runtime.executeInner(target, depth + 1);
+            return;
         }
         // Fallthrough (no chain): hints are lost — no successor to pass to
         // This is fine; the next call from top-level execute() has no predecessor.
-    }
-
-    fn loadHostLib(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
-        if (runtime.host_lib_handles.get(name)) |h| return h;
-        const c_name = runtime.allocator.dupeZ(u8, name) catch return null;
-        defer runtime.allocator.free(c_name);
-        const handle = std.posix.dlopen(c_name, std.posix.RTLD.LAZY) orelse return null;
-        runtime.host_lib_handles.put(runtime.allocator, name, handle) catch {};
-        return handle;
-    }
-
-    fn findHostSymbol(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
-        var hit = runtime.host_lib_handles.iterator();
-        while (hit.next()) |entry| {
-            if (std.posix.dlsym(entry.value_ptr.*, name)) |sym| return sym;
-        }
-        // Try loading common libs if not already loaded
-        for ([_][]const u8{"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1"}) |lib| {
-            if (runtime.host_lib_handles.contains(lib)) continue;
-            const handle = runtime.loadHostLib(lib) orelse continue;
-            if (std.posix.dlsym(handle, name)) |sym| return sym;
-        }
-        return null;
     }
 
     fn storeHints(runtime: *JitRuntime, hints: RegAlloc.RegHints) void {
@@ -401,123 +534,153 @@ const tb = try runtime.cache.allocateBlock();
     }
 
     fn syscallNumber(arm: u64) i64 {
-        return switch (arm) {
-            0 => 206, 1 => 207, 2 => 209, 3 => 210, 4 => 208,
-            5 => 188, 6 => 189, 7 => 190, 8 => 191, 9 => 192,
-            10 => 193, 11 => 194, 12 => 195, 13 => 196, 14 => 197,
-            15 => 198, 16 => 199, 17 => 79, 18 => 212, 19 => 290,
-            20 => 291, 21 => 233, 22 => 281, 23 => 32, 24 => 292,
-            26 => 294, 27 => 254, 28 => 255, 29 => 16, 30 => 251,
-            31 => 252, 32 => 73, 33 => 259, 34 => 258, 35 => 263,
-            36 => 266, 37 => 265, 38 => 264, 39 => 166, 40 => 165,
-            41 => 155, 42 => 180,
-            47 => 285, 48 => 269, 49 => 80, 50 => 81, 51 => 161,
-            52 => 91, 53 => 268, 54 => 260, 55 => 93, 56 => 257,
-            57 => 3, 58 => 153, 59 => 293, 60 => 179, 61 => 217,
-            63 => 0, 64 => 1, 65 => 19, 66 => 20, 67 => 17,
-            68 => 18, 69 => 295, 70 => 296,
-            72 => 270, 73 => 271, 74 => 289, 75 => 278, 76 => 275,
-            77 => 276, 78 => 267,
-            81 => 162, 82 => 74, 83 => 75, 84 => 76, 85 => 283,
-            86 => 286, 87 => 287, 88 => 0, 89 => 83,
-            90 => 82, 91 => 84, 92 => 135, 93 => 60, 94 => 231,
-            95 => 247, 96 => 218, 97 => 55, 98 => 202, 99 => 34,
-            100 => 36, 101 => 35, 102 => 37, 103 => 203, 104 => 204,
-            105 => 38, 106 => 0, 107 => 39, 108 => 23,
-            110 => 40, 111 => 41,
-            113 => 228, 114 => 229, 115 => 230, 116 => 0, 117 => 0,
-            118 => 142, 119 => 144, 120 => 145, 121 => 143,
-            122 => 203, 123 => 204, 124 => 24, 125 => 146,
-            126 => 147, 127 => 148, 128 => 137, 129 => 160,
-            130 => 200, 131 => 234, 132 => 138, 133 => 130,
-            134 => 13, 135 => 14, 136 => 127, 137 => 128,
-            138 => 129, 139 => 15,
-            140 => 0, 141 => 0, 142 => 0, 143 => 0, 144 => 0,
-            160 => 63, 161 => 109, 162 => 1, 163 => 111, 164 => 115,
-            165 => 116, 166 => 0, 167 => 157, 168 => 0, 169 => 96,
-            170 => 97, 171 => 0, 172 => 39, 173 => 110, 174 => 102,
-            175 => 107, 176 => 104, 177 => 108, 178 => 186,
-            179 => 0, 180 => 0, 181 => 0, 182 => 0, 183 => 0,
-            184 => 0, 185 => 0, 186 => 61, 187 => 0,
-            198 => 41, 199 => 53, 200 => 49, 201 => 50, 202 => 43,
-            203 => 42, 204 => 51, 205 => 0, 206 => 0,
-            209 => 58, 210 => 0,
-            213 => 187, 214 => 12, 215 => 11, 216 => 25, 217 => 44,
-            218 => 27, 219 => 28,
-            220 => 56,  // clone
-            221 => 57,  // fork
-            222 => 9,   // mmap
-            223 => 0,   // ARM64 __NR_mmap2 = not in x86
-            224 => 0,
-            225 => 58,  // vfork
-            226 => 10,  // mprotect
-            227 => 26,  // msync
-            228 => 149, // mlock
-            229 => 150, // munlock
-            230 => 151, // mlockall
-            231 => 152, // munlockall
-            232 => 27,  // mincore
-            233 => 28,  // madvise
-            234 => 1,   // arm64 specific
-            235 => 0,
-            236 => 0,   // arm64 specific
-            237 => 0,
-            238 => 0,   // arm64 specific
-            239 => 0,
-            240 => 0,   // arm64 specific
-            241 => 0,
-            242 => 288, // accept4
-            243 => 0,   // arm64 specific
-            244 => 0,
-            245 => 0,   // arm64 specific
-            246 => 0,
-            247 => 0,   // arm64 specific
-            248 => 0,
-            249 => 0,   // arm64 specific
-            250 => 0,
-            251 => 0,   // arm64 specific
-            252 => 0,
-            253 => 0,   // arm64 specific
-            254 => 0,
-            255 => 0,
-            260 => 61,  // wait4
-            261 => 0,
-            262 => 0,
-            263 => 0,
-            264 => 0,
-            265 => 304, // open_by_handle_at
-            266 => 0,
-            267 => 0,
-            268 => 0,
-            269 => 0,
-            270 => 0,
-            271 => 0,
-            272 => 0,
-            273 => 0,
-            274 => 314, // sched_setattr
-            275 => 315, // sched_getattr
-            276 => 316, // renameat2
-            277 => 317, // seccomp
-            278 => 318, // getrandom
-            279 => 319, // memfd_create
-            280 => 320, // kexec_file_load
-            281 => 321, // bpf
-            282 => 322, // execveat
-            283 => 323, // userfaultfd
-            284 => 325, // mlock2
-            285 => 326, // copy_file_range
-            286 => 0,
-            287 => 0,
-            288 => 329, // pkey_mprotect
-            289 => 330, // pkey_alloc
-            290 => 331, // pkey_free
-            291 => 332, // statx
-            292 => 0,
-            293 => 0,
-            294 => 334, // rseq
-            else => -1,
-        };
+        const idx = @as(usize, @intCast(arm));
+        if (idx >= SYSCALL_TABLE.len) return -1;
+        return @as(i64, SYSCALL_TABLE[idx]);
     }
+
+    const SYSCALL_TABLE: [512]i16 = brk: {
+        var tbl: [512]i16 = @splat(-1);
+        // 0-42
+        tbl[0] = 206; tbl[1] = 207; tbl[2] = 209; tbl[3] = 210; tbl[4] = 208;
+        tbl[5] = 188; tbl[6] = 189; tbl[7] = 190; tbl[8] = 191; tbl[9] = 192;
+        tbl[10] = 193; tbl[11] = 194; tbl[12] = 195; tbl[13] = 196; tbl[14] = 197;
+        tbl[15] = 198; tbl[16] = 199; tbl[17] = 79; tbl[18] = 212; tbl[19] = 290;
+        tbl[20] = 291; tbl[21] = 233; tbl[22] = 281; tbl[23] = 32; tbl[24] = 292;
+        // 25-26 gap
+        tbl[26] = 294; tbl[27] = 254; tbl[28] = 255; tbl[29] = 16; tbl[30] = 251;
+        tbl[31] = 252; tbl[32] = 73; tbl[33] = 259; tbl[34] = 258; tbl[35] = 263;
+        tbl[36] = 266; tbl[37] = 265; tbl[38] = 264; tbl[39] = 166; tbl[40] = 165;
+        tbl[41] = 155; tbl[42] = 180;
+        // 43-46 gap
+        tbl[47] = 285; tbl[48] = 269; tbl[49] = 80; tbl[50] = 81; tbl[51] = 161;
+        tbl[52] = 91; tbl[53] = 268; tbl[54] = 260; tbl[55] = 93; tbl[56] = 257;
+        tbl[57] = 3; tbl[58] = 153; tbl[59] = 293; tbl[60] = 179; tbl[61] = 217;
+        // 62 gap
+        tbl[63] = 0; tbl[64] = 1; tbl[65] = 19; tbl[66] = 20; tbl[67] = 17;
+        tbl[68] = 18; tbl[69] = 295; tbl[70] = 296;
+        // 71 gap
+        tbl[72] = 270; tbl[73] = 271; tbl[74] = 289; tbl[75] = 278; tbl[76] = 275;
+        tbl[77] = 276; tbl[78] = 267;
+        // 79-80 gap
+        tbl[81] = 162; tbl[82] = 74; tbl[83] = 75; tbl[84] = 76; tbl[85] = 283;
+        tbl[86] = 286; tbl[87] = 287; tbl[88] = 0; tbl[89] = 83;
+        tbl[90] = 82; tbl[91] = 84; tbl[92] = 135; tbl[93] = 60; tbl[94] = 231;
+        tbl[95] = 247; tbl[96] = 218; tbl[97] = 55; tbl[98] = 202; tbl[99] = 34;
+        tbl[100] = 36; tbl[101] = 35; tbl[102] = 37; tbl[103] = 203; tbl[104] = 204;
+        tbl[105] = 38; tbl[106] = 0; tbl[107] = 39; tbl[108] = 23;
+        // 109 gap
+        tbl[110] = 40; tbl[111] = 41;
+        // 112 gap
+        tbl[113] = 228; tbl[114] = 229; tbl[115] = 230; tbl[116] = 0; tbl[117] = 0;
+        tbl[118] = 142; tbl[119] = 144; tbl[120] = 145; tbl[121] = 143;
+        tbl[122] = 203; tbl[123] = 204; tbl[124] = 24; tbl[125] = 146;
+        tbl[126] = 147; tbl[127] = 148; tbl[128] = 137; tbl[129] = 160;
+        tbl[130] = 200; tbl[131] = 234; tbl[132] = 138; tbl[133] = 130;
+        tbl[134] = 13; tbl[135] = 14; tbl[136] = 127; tbl[137] = 128;
+        tbl[138] = 129; tbl[139] = 15;
+        tbl[140] = 0; tbl[141] = 0; tbl[142] = 0; tbl[143] = 0; tbl[144] = 0;
+        // 145-159 gap
+        tbl[160] = 63; tbl[161] = 109; tbl[162] = 1; tbl[163] = 111; tbl[164] = 115;
+        tbl[165] = 116; tbl[166] = 0; tbl[167] = 157; tbl[168] = 0; tbl[169] = 96;
+        tbl[170] = 97; tbl[171] = 0; tbl[172] = 39; tbl[173] = 110; tbl[174] = 102;
+        tbl[175] = 107; tbl[176] = 104; tbl[177] = 108; tbl[178] = 186;
+        tbl[179] = 0; tbl[180] = 0; tbl[181] = 0; tbl[182] = 0; tbl[183] = 0;
+        tbl[184] = 0; tbl[185] = 0; tbl[186] = 61; tbl[187] = 0;
+        // 188-197 gap
+        tbl[198] = 41; tbl[199] = 53; tbl[200] = 49; tbl[201] = 50; tbl[202] = 43;
+        tbl[203] = 42; tbl[204] = 51; tbl[205] = 0; tbl[206] = 0;
+        // 207-208 gap
+        tbl[209] = 58; tbl[210] = 0;
+        // 211-212 gap
+        tbl[213] = 187; tbl[214] = 12; tbl[215] = 11; tbl[216] = 25; tbl[217] = 44;
+        tbl[218] = 27; tbl[219] = 28;
+        tbl[220] = 56;  // clone
+        tbl[221] = 57;  // fork
+        tbl[222] = 9;   // mmap
+        tbl[223] = 0;   // ARM64 __NR_mmap2 = not in x86
+        tbl[224] = 0;
+        tbl[225] = 58;  // vfork
+        tbl[226] = 10;  // mprotect
+        tbl[227] = 26;  // msync
+        tbl[228] = 149; // mlock
+        tbl[229] = 150; // munlock
+        tbl[230] = 151; // mlockall
+        tbl[231] = 152; // munlockall
+        tbl[232] = 27;  // mincore
+        tbl[233] = 28;  // madvise
+        tbl[234] = 1;   // arm64 specific
+        tbl[235] = 0;
+        tbl[236] = 0;   // arm64 specific
+        tbl[237] = 0;
+        tbl[238] = 0;   // arm64 specific
+        tbl[239] = 0;
+        tbl[240] = 0;   // arm64 specific
+        tbl[241] = 0;
+        tbl[242] = 288; // accept4
+        tbl[243] = 0;   // arm64 specific
+        tbl[244] = 0;
+        tbl[245] = 0;   // arm64 specific
+        tbl[246] = 0;
+        tbl[247] = 0;   // arm64 specific
+        tbl[248] = 0;
+        tbl[249] = 0;   // arm64 specific
+        tbl[250] = 0;
+        tbl[251] = 0;   // arm64 specific
+        tbl[252] = 0;
+        tbl[253] = 0;   // arm64 specific
+        tbl[254] = 0;
+        tbl[255] = 0;
+        // 256-259 gap
+        tbl[260] = 61;  // wait4
+        tbl[261] = 0;
+        tbl[262] = 0;
+        tbl[263] = 0;
+        tbl[264] = 0;
+        tbl[265] = 304; // open_by_handle_at
+        tbl[266] = 0;
+        tbl[267] = 0;
+        tbl[268] = 0;
+        tbl[269] = 0;
+        tbl[270] = 0;
+        tbl[271] = 0;
+        tbl[272] = 0;
+        tbl[273] = 0;
+        tbl[274] = 314; // sched_setattr
+        tbl[275] = 315; // sched_getattr
+        tbl[276] = 316; // renameat2
+        tbl[277] = 317; // seccomp
+        tbl[278] = 318; // getrandom
+        tbl[279] = 319; // memfd_create
+        tbl[280] = 320; // kexec_file_load
+        tbl[281] = 321; // bpf
+        tbl[282] = 322; // execveat
+        tbl[283] = 323; // userfaultfd
+        tbl[284] = 325; // mlock2
+        tbl[285] = 326; // copy_file_range
+        tbl[286] = 0;
+        tbl[287] = 0;
+        tbl[288] = 329; // pkey_mprotect
+        tbl[289] = 330; // pkey_alloc
+        tbl[290] = 331; // pkey_free
+        tbl[291] = 332; // statx
+        tbl[292] = 0;
+        tbl[293] = 0;
+        tbl[294] = 334; // rseq
+        // 295-423 gap
+        tbl[424] = 434; // pidfd_open
+        tbl[425] = 435; // clone3
+        tbl[435] = 435; // clone3 (same number on x86-64)
+        tbl[436] = 436; // io_uring_setup (same on x86)
+        tbl[437] = 437; // io_uring_enter (same on x86)
+        tbl[438] = 438; // io_uring_register (same on x86)
+        tbl[439] = 439; // openat2 (same on x86)
+        tbl[440] = 440; // pidfd_getfd (same on x86)
+        tbl[441] = 441; // futex_waitv (same on x86)
+        tbl[442] = 442; // process_mrelease (same on x86)
+        break :brk tbl;
+    };
+
 
     fn handleSyscall(runtime: *JitRuntime) void {
         const arm_nr = runtime.state.x[8];
@@ -609,6 +772,50 @@ const tb = try runtime.cache.allocateBlock();
         return next_base;
     }
 
+    fn loadHostLib(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
+        if (runtime.host_libs.get(name)) |h| return h;
+        const c_name = runtime.allocator.alloc(u8, name.len + 1) catch return null;
+        defer runtime.allocator.free(c_name);
+        @memcpy(c_name[0..name.len], name);
+        c_name[name.len] = 0;
+        const handle = dlopen(@as([*:0]const u8, @ptrCast(c_name.ptr)), 1) orelse return null;
+        const owned = runtime.allocator.dupe(u8, name) catch return null;
+        runtime.host_libs.put(runtime.allocator, owned, handle) catch return null;
+        return handle;
+    }
+
+    fn dlsymZ(runtime: *JitRuntime, handle: *anyopaque, name: []const u8) ?*anyopaque {
+        const buf = runtime.allocator.alloc(u8, name.len + 1) catch return null;
+        defer runtime.allocator.free(buf);
+        @memcpy(buf[0..name.len], name);
+        buf[name.len] = 0;
+        return dlsym(handle, @as([*:0]const u8, @ptrCast(buf.ptr)));
+    }
+
+    fn findHostSym(runtime: *JitRuntime, name: []const u8) ?*anyopaque {
+        var it = runtime.host_libs.iterator();
+        while (it.next()) |entry| {
+            if (runtime.dlsymZ(entry.value_ptr.*, name)) |sym| return sym;
+        }
+        for ([_][]const u8{"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1"}) |lib| {
+            if (runtime.host_libs.contains(lib)) continue;
+            if (runtime.loadHostLib(lib)) |h| {
+                if (runtime.dlsymZ(h, name)) |sym| return sym;
+            }
+        }
+        return null;
+    }
+
+    fn getThunkPage(runtime: *JitRuntime) ![]u8 {
+        if (runtime.thunk_page) |p| return p;
+        const page = try std.posix.mmap(null, 4096,
+            std.posix.PROT{ .READ = true, .WRITE = true, .EXEC = true },
+            std.posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        runtime.thunk_page = page;
+        runtime.thunk_page_offset = 0;
+        return page;
+    }
+
     fn resolvePltEntries(runtime: *JitRuntime) !void {
         for (runtime.loaded_libs.items) |lib| {
             if (lib.symtab == 0 or lib.strtab == 0) continue;
@@ -632,6 +839,27 @@ const tb = try runtime.cache.allocateBlock();
 
                 const sym_idx = Elf.r_sym(r_info);
                 const sym_name = Elf.getSymbolName(guest, base, lib.symtab, lib.strtab, sym_idx) orelse continue;
+
+                // Compute GOT offset for patching
+                const got_off = r_offset - base;
+
+                // Try host library first — generate thunk if found
+                if (got_off + 8 <= guest.len) {
+                    if (runtime.findHostSym(sym_name)) |host_fn| {
+                        const tpage = try runtime.getThunkPage();
+                        if (runtime.thunk_page_offset + @as(usize, Thunk.THUNK_SIZE) <= tpage.len) {
+                            const thunk_buf = tpage[runtime.thunk_page_offset..];
+                            const emitted = Thunk.emitHostThunk(thunk_buf, @intFromPtr(host_fn));
+                            const code_addr = @intFromPtr(tpage.ptr) + runtime.thunk_page_offset;
+                            Thunk.patchThunkCall(emitted, code_addr, @intFromPtr(host_fn));
+                            std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], code_addr, .little);
+                            runtime.thunk_page_offset += emitted.len;
+                        }
+                        continue;
+                    }
+                }
+
+                // Fallback: JIT-translate the ARM64 code
                 const sym_val = Elf.findGlobalSymbol(runtime.loaded_libs.items, sym_name) orelse continue;
 
                 // JIT-translate the ARM64 code at sym_val
@@ -643,7 +871,7 @@ const tb = try runtime.cache.allocateBlock();
                 // Don't carry hints from guest execution — PLT is unrelated
                 runtime.has_pending_hints = false;
                 runtime.last_block_pc = 0;
-                const block = runtime.translateBlock(sym_val) catch {
+                const block = runtime.translateBlock(sym_val, 0) catch {
                     runtime.guest_mem = saved_mem;
                     runtime.guest_base = saved_base;
                     continue;
@@ -653,11 +881,8 @@ const tb = try runtime.cache.allocateBlock();
                 runtime.guest_base = saved_base;
 
                 // Patch GOT entry to point to translated x86-64 code
-                const got_off = r_offset - base;
-                if (got_off + 8 <= guest.len) {
-                    const x86_addr = @intFromPtr(block.host_addr.ptr);
-                    std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], x86_addr + @as(u64, @bitCast(r_addend)), .little);
-                }
+                const x86_addr = @intFromPtr(block.host_addr.ptr);
+                std.mem.writeInt(u64, guest[@intCast(got_off)..][0..8], x86_addr + @as(u64, @bitCast(r_addend)), .little);
             }
         }
     }
@@ -711,19 +936,13 @@ const tb = try runtime.cache.allocateBlock();
         // Don't carry hints — init/fini is unrelated to guest execution
         runtime.has_pending_hints = false;
         runtime.last_block_pc = 0;
-        const block = runtime.translateBlock(guest_addr) catch {
+        const block = runtime.translateBlock(guest_addr, 0) catch {
             runtime.guest_mem = saved_mem;
             runtime.guest_base = saved_base;
             return;
         };
 
-        // Execute the translated block
-        const block_fn: *const fn () callconv(.c) void =
-            @ptrCast(@alignCast(block.host_addr.ptr));
-        block_fn();
-
-        // Read x0 back using the block's register map
-        // (per-block allocator may map x0 to any host register)
+        // Execute the translated block with register setup and capture
         var cap_rdi: u64 = undefined;
         var cap_rsi: u64 = undefined;
         var cap_rdx: u64 = undefined;
@@ -739,7 +958,22 @@ const tb = try runtime.cache.allocateBlock();
         var cap_r13: u64 = undefined;
         var cap_r14: u64 = undefined;
         var cap_r15: u64 = undefined;
+        const guest_sp = runtime.state.sp;
+        const block_fn: *const fn (*anyopaque) callconv(.c) void =
+            @ptrCast(@alignCast(block.host_addr.ptr));
         asm volatile (
+            \\ mov %[sp], %%r15
+            \\ mov %[rt], %%r14
+            \\ mov %[x0], %%rdi
+            \\ mov %[x1], %%rsi
+            \\ mov %[x2], %%rdx
+            \\ mov %[x3], %%rcx
+            \\ mov %[x4], %%r8
+            \\ mov %[x5], %%r9
+            \\ mov %[x6], %%r10
+            \\ mov %[x7], %%r11
+            \\ mov %[x8], %%rax
+            \\ call *%%r12
             \\ movq %%rdi, %[v_rdi]
             \\ movq %%rsi, %[v_rsi]
             \\ movq %%rdx, %[v_rdx]
@@ -770,8 +1004,22 @@ const tb = try runtime.cache.allocateBlock();
               [v_r13] "=m" (cap_r13),
               [v_r14] "=m" (cap_r14),
               [v_r15] "=m" (cap_r15),
-            :
-            : .{ .memory = true }
+            : [fptr] "{r12}" (block_fn),
+              [x0] "r" (runtime.state.x[0]),
+              [x1] "r" (runtime.state.x[1]),
+              [x2] "r" (runtime.state.x[2]),
+              [x3] "r" (runtime.state.x[3]),
+              [x4] "r" (runtime.state.x[4]),
+              [x5] "r" (runtime.state.x[5]),
+              [x6] "r" (runtime.state.x[6]),
+              [x7] "r" (runtime.state.x[7]),
+              [x8] "r" (runtime.state.x[8]),
+              [sp] "r" (guest_sp),
+              [rt] "{r14}" (&runtime.l1_cache),
+            : .{ .rdi = true, .rsi = true, .rdx = true, .rcx = true,
+                .r8 = true, .r9 = true, .r10 = true, .r11 = true, .rax = true,
+                .rbx = true, .rbp = true, .r12 = true, .r13 = true, .r14 = true,
+                .r15 = true, .memory = true }
         );
 
         runtime.state.x[0] = switch (block.regmap[0] orelse .rdi) {
@@ -905,7 +1153,7 @@ test "MOVZ X0, #0x42" {
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
-    runtime.execute(runtime.state.pc);
+    runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 0x42), runtime.state.x[0]);
 }
 
@@ -917,7 +1165,7 @@ test "ADD X0, X1, #42" {
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
     runtime.state.x[1] = 100;
-    runtime.execute(runtime.state.pc);
+    runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 142), runtime.state.x[0]);
 }
 
@@ -940,7 +1188,7 @@ test "SVC write syscall" {
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
-    runtime.execute(runtime.state.pc);
+    runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 0x42), runtime.state.x[0]);
 }
 
@@ -952,7 +1200,7 @@ test "SUB + MOVZ pipeline" {
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
     runtime.state.x[1] = 50;
-    runtime.execute(runtime.state.pc);
+    runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 40), runtime.state.x[0]);
     try std.testing.expectEqual(@as(u64, 7), runtime.state.x[2]);
 }
@@ -968,7 +1216,7 @@ test "SVC register capture: x0 and x8 preserved" {
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
-    runtime.execute(runtime.state.pc);
+    runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 42), runtime.state.x[0]);
     try std.testing.expectEqual(@as(u64, 93), runtime.state.x[8]);
 }
@@ -983,7 +1231,7 @@ test "SVC getpid returns positive PID" {
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
-    runtime.execute(runtime.state.pc);
+    runtime.execute(runtime.state.pc, 0);
     try std.testing.expect(runtime.state.x[0] > 0);
     try std.testing.expectEqual(@as(u64, 172), runtime.state.x[8]);
 }

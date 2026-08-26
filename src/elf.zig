@@ -196,6 +196,10 @@ pub const DynLib = struct {
     relasz: u64,
     jmprel: u64,
     pltrelsz: u64,
+    // TLS info (0 if no TLS segment)
+    tls_off: u64 = 0,
+    tls_size: u64 = 0,
+    tls_align: u64 = 0,
 };
 
 /// Load a dynamic library into guest memory and parse its metadata.
@@ -226,7 +230,8 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
                 var ri: usize = 0;
                 while (ri < num_rela) : (ri += 1) {
                     const rela_fileoff = loadVaddrToFileOffset(elf_bytes, getPhdrInfo(elf_bytes).?.phoff, getPhdrInfo(elf_bytes).?.phnum, d.rela + ri * @sizeOf(Elf64Rela)) orelse continue;
-                    if (rela_fileoff + @sizeOf(Elf64Rela) > elf_bytes.len) continue;
+                    // Subtraction-based range check (avoids addition overflow)
+                    if (rela_fileoff > elf_bytes.len or elf_bytes.len - rela_fileoff < @sizeOf(Elf64Rela)) continue;
                     const r_offset = std.mem.readInt(u64, elf_bytes[@intCast(rela_fileoff)..][0..8], .little);
                     const r_info = std.mem.readInt(u64, elf_bytes[@intCast(rela_fileoff + 8)..][0..8], .little);
                     const r_addend = std.mem.readInt(i64, elf_bytes[@intCast(rela_fileoff + 16)..][0..8], .little);
@@ -234,11 +239,10 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
                         // r_offset is a vaddr relative to the original base (0 for .so).
                         // In guest_mem, data is at offset raw.guest_base from start.
                         // So the GOT entry is at r_offset in guest_mem.
-                        if (r_offset + 8 <= guest_mem.len) {
-                            const value = load_base + @as(u64, @bitCast(r_addend));
-                            std.mem.writeInt(u64, guest_mem[@intCast(r_offset)..][0..8], value, .little);
-                            fix_count += 1;
-                        }
+                        if (r_offset > guest_mem.len or guest_mem.len - r_offset < 8) continue;
+                        const value = load_base + @as(u64, @bitCast(r_addend));
+                        std.mem.writeInt(u64, guest_mem[@intCast(r_offset)..][0..8], value, .little);
+                        fix_count += 1;
                     }
                 }
             }
@@ -249,6 +253,25 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
     const e_phoff = getPhdrInfo(elf_bytes).?.phoff;
     const e_phnum = getPhdrInfo(elf_bytes).?.phnum;
     const dyn2 = parseDynamic(elf_bytes, e_phoff, e_phnum);
+
+    // Detect PT_TLS in program headers
+    var tls_off: u64 = 0;
+    var tls_size: u64 = 0;
+    var tls_align: u64 = 0;
+    if (getPhdrInfo(elf_bytes)) |ph_info| {
+        var pi: u16 = 0;
+        while (pi < ph_info.phnum) : (pi += 1) {
+            const phoff2 = ph_info.phoff + pi * @sizeOf(Elf64Phdr);
+            if (phoff2 + @sizeOf(Elf64Phdr) > elf_bytes.len) break;
+            const p_type2 = std.mem.readInt(u32, elf_bytes[@intCast(phoff2)..][0..4], .little);
+            if (p_type2 == PT_TLS) {
+                tls_off = std.mem.readInt(u64, elf_bytes[@intCast(phoff2 + 16)..][0..8], .little);
+                tls_size = std.mem.readInt(u64, elf_bytes[@intCast(phoff2 + 40)..][0..8], .little);
+                tls_align = std.mem.readInt(u64, elf_bytes[@intCast(phoff2 + 48)..][0..8], .little);
+                break;
+            }
+        }
+    }
 
     var result = DynLib{
         .name = name,
@@ -270,6 +293,9 @@ pub fn loadDynLib(allocator: std.mem.Allocator, elf_bytes: []const u8, name: []c
         .relasz = 0,
         .jmprel = 0,
         .pltrelsz = 0,
+        .tls_off = tls_off,
+        .tls_size = tls_size,
+        .tls_align = tls_align,
     };
 
     if (dyn2) |d| {
@@ -313,13 +339,18 @@ pub fn findGlobalSymbol(libs: []const DynLib, name: []const u8) ?u64 {
         if (lib.strtab == 0 or lib.symtab == 0) continue;
 
         // Walk the symbol table looking for a name match
-        // (Heuristic: search first N entries)
-        const max_sym: usize = 4096;
+        // Limit search to available space between symtab and strtab, capped at 65536
+        const max_sym: usize = if (lib.strtab > lib.symtab)
+            @min(@as(usize, @intCast((lib.strtab - lib.symtab) / @sizeOf(Elf64Sym))), @as(usize, 65536))
+        else
+            65536;
         var i: u64 = 1; // skip STN_UNDEF
         while (i < max_sym) : (i += 1) {
+            // i * sizeof(Elf64Sym) won't overflow: i < 65536, sizeof=24 → 1.5M
             const sym_guest = lib.symtab + i * @sizeOf(Elf64Sym);
+            if (sym_guest < lib.guest_base) break;
             const mem_off = sym_guest - lib.guest_base;
-            if (mem_off + 8 > lib.guest_mem.len) break;
+            if (mem_off > lib.guest_mem.len or lib.guest_mem.len - mem_off < 8) break;
 
             const st_name = std.mem.readInt(u32, lib.guest_mem[@intCast(mem_off)..][0..4], .little);
             const st_info = lib.guest_mem[@intCast(mem_off + 4)];
@@ -330,7 +361,10 @@ pub fn findGlobalSymbol(libs: []const DynLib, name: []const u8) ?u64 {
             if (st_value == 0 or st_shndx == 0) continue;
 
             // Read the symbol name from string table
-            const str_off = (lib.strtab + st_name) - lib.guest_base;
+            if (lib.strtab > std.math.maxInt(u64) - @as(u64, st_name)) continue;
+            const str_guest = lib.strtab + st_name;
+            if (str_guest < lib.guest_base) continue;
+            const str_off = str_guest - lib.guest_base;
             if (str_off > lib.guest_mem.len) continue;
             const max_len = @min(@as(usize, 256), lib.guest_mem.len - @as(usize, @intCast(str_off)));
             const sym_name = lib.guest_mem[@intCast(str_off)..][0..max_len];
@@ -357,10 +391,14 @@ pub fn resolveLibrary(lib: *DynLib, all_libs: []const DynLib, elf_bytes: []const
     // Helper: read relocation entries from guest memory
     const readRela = struct {
         fn read(mem: []const u8, b: u64, vaddr: u64, idx: usize) ?struct { u64, u64, i64 } {
-            const addr = vaddr + idx * @sizeOf(Elf64Rela);
+            // Guard multiplication overflow for idx * sizeof(Elf64Rela)
+            const rela_ent_size: usize = @sizeOf(Elf64Rela);
+            if (idx > std.math.maxInt(usize) / rela_ent_size) return null;
+            const addr = vaddr + idx * rela_ent_size;
             if (addr < b) return null;
             const off = addr - b;
-            if (off + @sizeOf(Elf64Rela) > mem.len) return null;
+            // Subtraction-based range check
+            if (off > mem.len or mem.len - off < @sizeOf(Elf64Rela)) return null;
             const r_off = std.mem.readInt(u64, mem[@intCast(off)..][0..8], .little);
             const r_info = std.mem.readInt(u64, mem[@intCast(off + 8)..][0..8], .little);
             const r_add = std.mem.readInt(i64, mem[@intCast(off + 16)..][0..8], .little);
@@ -381,10 +419,10 @@ pub fn resolveLibrary(lib: *DynLib, all_libs: []const DynLib, elf_bytes: []const
                     const sym_idx = r_sym(r_info);
                     const sym_name = getSymbolName(guest, base, lib.symtab, lib.strtab, sym_idx) orelse continue;
                     const sym_val = findGlobalSymbol(all_libs, sym_name) orelse continue;
+                    if (r_off < base) continue;
                     const target_off = r_off - base;
-                    if (target_off + 8 <= guest.len) {
-                        std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], sym_val + @as(u64, @bitCast(r_add)), .little);
-                    }
+                    if (target_off > guest.len or guest.len - target_off < 8) continue;
+                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], sym_val + @as(u64, @bitCast(r_add)), .little);
                 }
             }
         }
@@ -403,10 +441,10 @@ pub fn resolveLibrary(lib: *DynLib, all_libs: []const DynLib, elf_bytes: []const
                     const sym_idx = r_sym(r_info);
                     const sym_name = getSymbolName(guest, base, lib.symtab, lib.strtab, sym_idx) orelse continue;
                     const sym_val = findGlobalSymbol(all_libs, sym_name) orelse continue;
+                    if (r_off < base) continue;
                     const target_off = r_off - base;
-                    if (target_off + 8 <= guest.len) {
-                        std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], sym_val + @as(u64, @bitCast(r_add)), .little);
-                    }
+                    if (target_off > guest.len or guest.len - target_off < 8) continue;
+                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], sym_val + @as(u64, @bitCast(r_add)), .little);
                 }
             }
         }
@@ -424,8 +462,6 @@ pub fn getNeededLibs(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, allocato
     // We need DT_STRTAB address to resolve names.
     var strtab_vaddr: u64 = 0;
     var strtab_fileoff: u64 = 0;
-    var strtab_load_vaddr: u64 = 0;
-    var strtab_load_fileoff: u64 = 0;
     var i: u16 = 0;
     while (i < e_phnum) : (i += 1) {
         const phoff = e_phoff + i * @sizeOf(Elf64Phdr);
@@ -435,17 +471,16 @@ pub fn getNeededLibs(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, allocato
         const p_off2 = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 8)..][0..8], .little);
         const p_memsz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
         if (dyn.strtab != 0 and dyn.strtab >= p_vaddr and dyn.strtab < p_vaddr + p_memsz) {
+            const str_off_in_seg = dyn.strtab - p_vaddr; // safe: dyn.strtab >= p_vaddr
+            if (p_off2 > std.math.maxInt(u64) - str_off_in_seg) return result;
             strtab_vaddr = dyn.strtab;
-            strtab_fileoff = p_off2 + (dyn.strtab - p_vaddr);
-            strtab_load_vaddr = p_vaddr;
-            strtab_load_fileoff = p_off2;
+            strtab_fileoff = p_off2 + str_off_in_seg;
         }
     }
     if (strtab_vaddr == 0) return result;
 
     // Find the PT_LOAD containing .dynamic
     var dyn_fileoff: u64 = 0;
-    var dyn_load_vaddr: u64 = 0;
     i = 0;
     while (i < e_phnum) : (i += 1) {
         const phoff = e_phoff + i * @sizeOf(Elf64Phdr);
@@ -454,21 +489,28 @@ pub fn getNeededLibs(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, allocato
         const p_vaddr = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 16)..][0..8], .little);
         const p_off2 = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 8)..][0..8], .little);
         const p_memsz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
+        // Use dyn.rela as a proxy vaddr within .dynamic segment (same segment, near .dynamic)
         if (dyn.rela != 0 and dyn.rela >= p_vaddr and dyn.rela < p_vaddr + p_memsz) {
-            dyn_fileoff = p_off2 + (dyn.rela - p_vaddr);
-            dyn_load_vaddr = p_vaddr;
+            const rela_off_in_seg = dyn.rela - p_vaddr; // safe: dyn.rela >= p_vaddr
+            if (p_off2 > std.math.maxInt(u64) - rela_off_in_seg) return result;
+            dyn_fileoff = p_off2 + rela_off_in_seg;
             break;
         }
     }
     if (dyn_fileoff == 0) return result;
 
+    // Walk .dynamic entries via file offset
+    if (dyn_fileoff > elf_bytes.len) return result;
     var dyn_offset: usize = @intCast(dyn_fileoff);
-    while (dyn_offset + @sizeOf(Elf64Dyn) <= elf_bytes.len) {
+    while (dyn_offset + @sizeOf(Elf64Dyn) > dyn_offset and // guard overflow
+           dyn_offset + @sizeOf(Elf64Dyn) <= elf_bytes.len)
+    {
         const d_tag = std.mem.readInt(i64, elf_bytes[dyn_offset..][0..8], .little);
         const d_val = std.mem.readInt(u64, elf_bytes[dyn_offset + 8..][0..8], .little);
         if (d_tag == DT_NULL) break;
         if (d_tag == DT_NEEDED) {
             // Read the library name from the string table
+            if (d_val > std.math.maxInt(u64) - strtab_fileoff) continue; // overflow guard
             const str_off = strtab_fileoff + d_val;
             if (str_off < elf_bytes.len) {
                 const remaining = elf_bytes.len - @as(usize, @intCast(str_off));
@@ -488,10 +530,15 @@ pub fn getNeededLibs(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, allocato
 /// Get the name of a symbol by its index.
 pub fn getSymbolName(guest: []const u8, base: u64, symtab: u64, strtab: u64, sym_idx: u64) ?[]const u8 {
     if (sym_idx == 0 or symtab == 0 or strtab == 0) return null;
-    const sym_guest = symtab + sym_idx * @sizeOf(Elf64Sym);
+    // Guard multiplication overflow: sym_idx * sizeof(Elf64Sym)
+    const sym_ent_size: u64 = @sizeOf(Elf64Sym);
+    if (sym_idx > std.math.maxInt(u64) / sym_ent_size) return null;
+    const sym_byte_off = sym_idx * sym_ent_size;
+    if (symtab > std.math.maxInt(u64) - sym_byte_off) return null;
+    const sym_guest = symtab + sym_byte_off;
     if (sym_guest < base) return null;
     const off = sym_guest - base;
-    if (off + 8 > guest.len) return null;
+    if (off > guest.len or guest.len - off < 8) return null;
     const st_name = std.mem.readInt(u32, guest[@intCast(off)..][0..4], .little);
     const str_guest = strtab + st_name;
     if (str_guest < base) return null;
@@ -531,6 +578,42 @@ pub fn r_type(r_info: u64) u64 {
 
 pub fn r_sym(r_info: u64) u64 {
     return r_info >> 32;
+}
+
+// ── TLS segment info ──────────────────────────────────────────────
+
+pub const TlsSegment = struct {
+    file_off: u64,
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+    alignment: u64,
+};
+
+/// Find and return the PT_TLS segment info from an ELF file.
+pub fn getTlsSegment(elf_bytes: []const u8) ?TlsSegment {
+    const info = getPhdrInfo(elf_bytes) orelse return null;
+    var i: u16 = 0;
+    while (i < info.phnum) : (i += 1) {
+        const phoff = info.phoff + i * @sizeOf(Elf64Phdr);
+        if (phoff + @sizeOf(Elf64Phdr) > elf_bytes.len) return null;
+        const p_type = std.mem.readInt(u32, elf_bytes[@intCast(phoff)..][0..4], .little);
+        if (p_type == PT_TLS) {
+            const p_offset = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 8)..][0..8], .little);
+            const p_vaddr = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 16)..][0..8], .little);
+            const p_filesz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 32)..][0..8], .little);
+            const p_memsz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
+            const p_align = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 48)..][0..8], .little);
+            return TlsSegment{
+                .file_off = p_offset,
+                .vaddr = p_vaddr,
+                .filesz = p_filesz,
+                .memsz = p_memsz,
+                .alignment = p_align,
+            };
+        }
+    }
+    return null;
 }
 
 // ── Dynamic linker ───────────────────────────────────────────────
@@ -608,17 +691,23 @@ pub fn parseDynamic(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16) ?DynResul
     }
     if (load_fileoff == 0) return null;
 
-    const dyn_fileoff = load_fileoff + (dyn_vaddr - load_vaddr);
+    // Guard against vaddr underflow and addition overflow
+    if (dyn_vaddr < load_vaddr) return null;
+    const dyn_offset_in_seg = dyn_vaddr - load_vaddr;
+    if (load_fileoff > std.math.maxInt(u64) - dyn_offset_in_seg) return null;
+    const dyn_fileoff = load_fileoff + dyn_offset_in_seg;
+
     const max_entries = @as(usize, @intCast(dyn_size / @sizeOf(Elf64Dyn)));
-    if (max_entries == 0 or max_entries > 1024) return null;
+    if (max_entries == 0 or max_entries > 512) return null;
 
-    var ents: [128]Elf64Dyn = undefined;
-    const actual_entries = @min(max_entries, ents.len);
-    const copy_bytes = @as(u32, actual_entries) * @as(u32, @sizeOf(Elf64Dyn));
-    if (dyn_fileoff + copy_bytes > elf_bytes.len) return null;
-    @memcpy(std.mem.sliceAsBytes(ents[0..actual_entries]), elf_bytes[@intCast(dyn_fileoff)..][0..copy_bytes]);
+    var ents: [256]Elf64Dyn = undefined;
+    const num_copy = if (max_entries < 256) max_entries else @as(usize, 256);
+    const copy_bytes = num_copy * @sizeOf(Elf64Dyn);
+    // Overflow-safe range check: subtract rather than add
+    if (dyn_fileoff > elf_bytes.len or elf_bytes.len - dyn_fileoff < copy_bytes) return null;
+    @memcpy(std.mem.sliceAsBytes(ents[0..num_copy]), elf_bytes[@intCast(dyn_fileoff)..][0..copy_bytes]);
 
-    for (ents[0..actual_entries]) |entry| {
+    for (ents[0..num_copy]) |entry| {
         switch (entry.d_tag) {
             DT_NULL => break,
             DT_NEEDED => {},
@@ -657,7 +746,8 @@ pub fn applyRelocations(guest: []u8, guest_base: u64, elf_bytes: []const u8, e_p
         var i: usize = 0;
         while (i < num_rela) : (i += 1) {
             const rela_off = loadVaddrToFileOffset(elf_bytes, e_phoff, e_phnum, dyn.rela + i * @sizeOf(Elf64Rela)) orelse continue;
-            if (rela_off + @sizeOf(Elf64Rela) > elf_bytes.len) continue;
+            // Subtraction-based range check (avoids addition overflow)
+            if (rela_off > elf_bytes.len or elf_bytes.len - rela_off < @sizeOf(Elf64Rela)) continue;
 
             const r_offset = std.mem.readInt(u64, elf_bytes[@intCast(rela_off)..][0..8], .little);
             const r_info = std.mem.readInt(u64, elf_bytes[@intCast(rela_off + 8)..][0..8], .little);
@@ -666,33 +756,34 @@ pub fn applyRelocations(guest: []u8, guest_base: u64, elf_bytes: []const u8, e_p
 
             if (r_type2 == R_AARCH64_RELATIVE) {
                 // R_AARCH64_RELATIVE: *r_offset = guest_base + addend
+                if (r_offset < guest_base) continue;
                 const target_off = r_offset - guest_base;
-                if (target_off + 8 <= guest.len) {
-                    const value = guest_base + @as(u64, @bitCast(r_addend));
-                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
-                    count += 1;
-                }
+                // Subtraction-based range check for guest memory
+                if (target_off > guest.len or guest.len - target_off < 8) continue;
+                const value = guest_base + @as(u64, @bitCast(r_addend));
+                std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
+                count += 1;
             } else if (r_type2 == R_AARCH64_GLOB_DAT) {
                 // R_AARCH64_GLOB_DAT: *r_offset = symbol value
                 // For now, resolve as relative (workaround for simple cases)
                 const sym_idx = r_sym(r_info);
                 const sym_val = findSymbolValue(elf_bytes, e_phoff, e_phnum, dyn.symtab, dyn.strtab, dyn.strsz, sym_idx) orelse 0;
+                if (r_offset < guest_base) continue;
                 const target_off = r_offset - guest_base;
-                if (target_off + 8 <= guest.len) {
-                    const value = if (sym_val != 0) guest_base + sym_val else guest_base;
-                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
-                    count += 1;
-                }
+                if (target_off > guest.len or guest.len - target_off < 8) continue;
+                const value = if (sym_val != 0) guest_base + sym_val else guest_base;
+                std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
+                count += 1;
             } else if (r_type2 == R_AARCH64_JUMP_SLOT) {
                 // R_AARCH64_JUMP_SLOT: PLT entry – set to zero (will be lazily resolved)
+                if (r_offset < guest_base) continue;
                 const target_off = r_offset - guest_base;
-                if (target_off + 8 <= guest.len) {
-                    const sym_idx = r_sym(r_info);
-                    const sym_val = findSymbolValue(elf_bytes, e_phoff, e_phnum, dyn.symtab, dyn.strtab, dyn.strsz, sym_idx) orelse 0;
-                    const value = if (sym_val != 0) guest_base + sym_val else 0;
-                    std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
-                    count += 1;
-                }
+                if (target_off > guest.len or guest.len - target_off < 8) continue;
+                const sym_idx = r_sym(r_info);
+                const sym_val = findSymbolValue(elf_bytes, e_phoff, e_phnum, dyn.symtab, dyn.strtab, dyn.strsz, sym_idx) orelse 0;
+                const value = if (sym_val != 0) guest_base + sym_val else 0;
+                std.mem.writeInt(u64, guest[@intCast(target_off)..][0..8], value, .little);
+                count += 1;
             }
         }
     }
@@ -710,7 +801,9 @@ fn loadVaddrToFileOffset(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, vadd
         const p_vaddr = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 16)..][0..8], .little);
         const p_memsz = std.mem.readInt(u64, elf_bytes[@intCast(phoff + 40)..][0..8], .little);
         if (vaddr >= p_vaddr and vaddr < p_vaddr + p_memsz) {
-            return p_offset + (vaddr - p_vaddr);
+            const off_in_seg = vaddr - p_vaddr; // safe: vaddr >= p_vaddr
+            if (p_offset > std.math.maxInt(u64) - off_in_seg) return null;
+            return p_offset + off_in_seg;
         }
     }
     return null;
@@ -719,7 +812,12 @@ fn loadVaddrToFileOffset(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, vadd
 /// Find the value (address) of a symbol by index.
 fn findSymbolValue(elf_bytes: []const u8, e_phoff: u64, e_phnum: u16, symtab_vaddr: u64, strtab_vaddr: u64, strsz: u64, sym_idx: u64) ?u64 {
     if (sym_idx == 0) return null; // STN_UNDEF
-    const sym_off = loadVaddrToFileOffset(elf_bytes, e_phoff, e_phnum, symtab_vaddr + sym_idx * @sizeOf(Elf64Sym)) orelse return null;
+    // Guard multiplication overflow: sym_idx * sizeof(Elf64Sym)
+    const sym_ent_size: u64 = @sizeOf(Elf64Sym);
+    if (sym_idx > std.math.maxInt(u64) / sym_ent_size) return null;
+    const sym_byte_off = sym_idx * sym_ent_size;
+    if (symtab_vaddr > std.math.maxInt(u64) - sym_byte_off) return null;
+    const sym_off = loadVaddrToFileOffset(elf_bytes, e_phoff, e_phnum, symtab_vaddr + sym_byte_off) orelse return null;
     if (sym_off + @sizeOf(Elf64Sym) > elf_bytes.len) return null;
 
     const st_name = std.mem.readInt(u32, elf_bytes[@intCast(sym_off)..][0..4], .little);

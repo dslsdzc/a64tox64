@@ -13,10 +13,12 @@ const X86Reg = Emit.X86Reg;
 const RegisterMap = Emit.RegisterMap;
 
 /// Host register pool. First 8 are call-clobbered (fast, no preservation cost),
-/// last 6 are callee-saved (preferred for high-frequency ARM64 regs).
+/// last 5 are callee-saved (preferred for high-frequency ARM64 regs).
+/// R14 reserved for L1 cache base (indirect branch) + mapReg fallback.
+/// R15 reserved for guest SP (sp_get/sp_put).
 const host_regs = [_]X86Reg{
     .rdi, .rsi, .rdx, .rcx, .r8, .r9, .r10, .r11,
-    .rbx, .rbp, .r12, .r13,
+    .rbx, .rbp, .r12, .r13, // R14+R15 excluded (cache + SP)
 };
 
 /// Register allocation hints from predecessor blocks.
@@ -41,6 +43,13 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         m.* = if (i == 8) @as(?X86Reg, .rax) else null;
     }
 
+    // Score computation: each ARM register referenced in ops gets a score
+    // based on its usage frequency (weighted by hotness). ARM registers are
+    // then sorted by score descending and allocated to host registers in that
+    // order. Higher-scored ARM regs get callee-saved host regs (r15, r13, r12,
+    // rbp, rbx) first, while lower-scored regs get call-clobbered host regs.
+    // This ensures the most-frequently-used ARM registers benefit from
+    // callee-saved preservation across block boundaries.
     var score: [31]f32 = undefined;
     for (&score) |*s| s.* = 0;
     for (ops) |op| {
@@ -48,6 +57,9 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         if (op.src0 < 31) score[op.src0] += 1.0;
         if (op.src1 < 31 and op.src1 != 0x1F) score[op.src1] += 1.0;
     }
+    // Boost x16 score — used as SP temporary for LDP/STP with SP,
+    // must always get a host register to avoid mapReg fallback conflict.
+    score[16] += 10.0;
     if (hotness > 1.0) {
         for (&score) |*s| s.* *= hotness;
     }
@@ -69,7 +81,7 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
     }
 
     // Sort by frequency
-    var sorted: [30]usize = undefined;
+    var sorted: [31]usize = undefined;
     for (&sorted, 0..) |*s, i| s.* = i;
     var i: usize = 0;
     while (i < sorted.len) : (i += 1) {
@@ -81,40 +93,10 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         const tmp = sorted[i]; sorted[i] = sorted[best]; sorted[best] = tmp;
     }
 
-    // If x29 is used but not hinted (not mapped in predecessor), force-map it.
-    // x29 (frame pointer) must have a dedicated host register to avoid spill
-    // conflicts with other null-mapped registers (R11 temp) across blocks.
-    if (score[29] > 0 and mapping[29] == null) {
-        for (host_regs, 0..) |reg, idx| {
-            if (idx >= 8 and idx < 12) { // callee-saved slots
-                const h = @intFromEnum(reg);
-                if (!used_hosts[h]) {
-                    mapping[29] = reg;
-                    used_hosts[h] = true;
-                    hint_arm[29] = true;
-                    break;
-                }
-            }
-        }
-        if (mapping[29] == null) {
-            for (host_regs, 0..) |reg, idx| {
-                if (idx < 8) { // call-clobbered
-                    const h = @intFromEnum(reg);
-                    if (!used_hosts[h]) {
-                        mapping[29] = reg;
-                        used_hosts[h] = true;
-                        hint_arm[29] = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     // Assign non-hinted ARM regs via frequency
     var used: usize = 0;
     var callee_used: usize = 0;
-    const num_callee: usize = 4;
+    const num_callee: usize = 4; // host_regs has 12 entries (first 8 clobbered, last 4 callee-saved)
     const num_clobber: usize = 8;
 
     for (sorted) |arm| {
@@ -122,18 +104,20 @@ pub fn allocateAdv(ops: []const IROp, hotness: f32, hints: ?*const RegHints) Reg
         if (hint_arm[arm]) continue;
         while (callee_used < num_callee) {
             const host_idx = num_clobber + callee_used;
-            if (!used_hosts[host_idx]) {
+            const reg_enum = @intFromEnum(host_regs[host_idx]);
+            if (!used_hosts[reg_enum]) {
                 mapping[arm] = host_regs[host_idx];
-                used_hosts[host_idx] = true;
+                used_hosts[reg_enum] = true;
                 callee_used += 1;
                 break;
             }
             callee_used += 1;
         } else {
             while (used < num_clobber) {
-                if (!used_hosts[used]) {
+                const reg_enum2 = @intFromEnum(host_regs[used]);
+                if (!used_hosts[reg_enum2]) {
                     mapping[arm] = host_regs[used];
-                    used_hosts[used] = true;
+                    used_hosts[reg_enum2] = true;
                     used += 1;
                     break;
                 }

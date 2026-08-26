@@ -7,6 +7,7 @@ const std = @import("std");
 const Ir = @import("ir.zig");
 const IROp = Ir.IROp;
 const Tag = Ir.Tag;
+const Peephole = @import("peephole.zig");
 
 pub const X86Reg = enum(u4) {
     rax = 0, rcx = 1, rdx = 2, rbx = 3,
@@ -70,7 +71,7 @@ pub const EmitContext = struct {
 
 fn mapReg(regmap: *const RegisterMap, arm_reg: u16) X86Reg {
     if (arm_reg >= 31) return .rax; // XZR → RAX as sentinel
-    return regmap[arm_reg] orelse .r11;
+    return regmap[arm_reg] orelse .r14;
 }
 
 /// Returns true if the ARM64 register is XZR (the zero register).
@@ -94,8 +95,6 @@ fn threeOp(
     ctx: *EmitContext,
     dst: X86Reg,
     src0: X86Reg,
-    _: u8,
-    _: u8,
 ) void {
     if (dst == src0) return;
     emitMovReg(ctx, dst, src0);
@@ -104,6 +103,7 @@ fn threeOp(
 // ── ALU emission ───────────────────────────────────────────────────
 
 fn emitAdd(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const src0_is_xzr = isXzr(op.src0);
     const cond = op.flags;
@@ -119,7 +119,7 @@ fn emitAdd(ctx: *EmitContext, op: IROp) void {
             emitMovCst(ctx, dst, op.imm);
         } else {
             const src0 = mapReg(ctx.regmap, op.src0);
-            threeOp(ctx, dst, src0, 0x01, 0x03);
+            threeOp(ctx, dst, src0);
             if (op.imm <= 127) {
                 ctx.rex(true, 0, 0, @intFromEnum(dst));
                 ctx.byte(0x83);
@@ -134,7 +134,7 @@ fn emitAdd(ctx: *EmitContext, op: IROp) void {
         }
     } else if (op.src1 != 0x1F) {
         const src0 = mapReg(ctx.regmap, op.src0);
-        threeOp(ctx, dst, src0, 0x01, 0x03);
+        threeOp(ctx, dst, src0);
         const src1 = mapReg(ctx.regmap, op.src1);
         ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
         ctx.byte(0x01);
@@ -179,6 +179,7 @@ fn emitCSel(ctx: *EmitContext, dst: X86Reg, rn: X86Reg, rm: X86Reg, arm_cond: u1
 }
 
 fn emitSub(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const src0_is_xzr = isXzr(op.src0);
 
@@ -191,7 +192,7 @@ fn emitSub(ctx: *EmitContext, op: IROp) void {
             ctx.modrm(0b11, 3, @intFromEnum(dst));
         } else {
             const src0 = mapReg(ctx.regmap, op.src0);
-            threeOp(ctx, dst, src0, 0x29, 0x2B);
+            threeOp(ctx, dst, src0);
             if (op.imm <= 127) {
                 ctx.rex(true, 0, 0, @intFromEnum(dst));
                 ctx.byte(0x83);
@@ -206,7 +207,7 @@ fn emitSub(ctx: *EmitContext, op: IROp) void {
         }
     } else if (op.src1 != 0x1F) {
         const src0 = mapReg(ctx.regmap, op.src0);
-        threeOp(ctx, dst, src0, 0x29, 0x2B);
+        threeOp(ctx, dst, src0);
         const src1 = mapReg(ctx.regmap, op.src1);
         ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
         ctx.byte(0x29);
@@ -223,13 +224,14 @@ fn emitSub(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitAddCarry(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     // ADC: dst = src0 + src1 + CF (same as ADD but with carry-in)
     // x86 opcode: 11 /r (instead of ADD's 01 /r)
     const dst = mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
     if (op.src1 != 0x1F) {
         const src1 = mapReg(ctx.regmap, op.src1);
-        threeOp(ctx, dst, src0, 0x11, 0x13);
+        threeOp(ctx, dst, src0);
         ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
         ctx.byte(0x11);
         ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
@@ -237,6 +239,7 @@ fn emitAddCarry(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitSubBorrow(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     // ARM64 SBC: Xd = Xn - Xm - !C
     // x86 SBB:   dst = dst - src - CF
     //
@@ -248,7 +251,7 @@ fn emitSubBorrow(ctx: *EmitContext, op: IROp) void {
     if (op.src1 != 0x1F) {
         const src1 = mapReg(ctx.regmap, op.src1);
         ctx.byte(0xF5); // CMC: CF = !C (invert back for borrow semantics)
-        threeOp(ctx, dst, src0, 0x19, 0x1B);
+        threeOp(ctx, dst, src0);
         ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
         ctx.byte(0x19);
         ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
@@ -256,10 +259,11 @@ fn emitSubBorrow(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitMul(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
 
-    threeOp(ctx, dst, src0, 0, 0);
+    threeOp(ctx, dst, src0);
     const src1 = mapReg(ctx.regmap, op.src1);
 
     ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
@@ -269,6 +273,7 @@ fn emitMul(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitMulHiS(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     // SMULH: signed multiply high → RDX
     // mov rax, Rn; imul Rm; mov Rd, rdx
     const dst = mapReg(ctx.regmap, op.dest);
@@ -282,6 +287,7 @@ fn emitMulHiS(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitMulHiU(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     // UMULH: unsigned multiply high → RDX
     // mov rax, Rn; mul Rm; mov Rd, rdx
     const dst = mapReg(ctx.regmap, op.dest);
@@ -294,11 +300,12 @@ fn emitMulHiU(ctx: *EmitContext, op: IROp) void {
     emitMovReg(ctx, dst, .rdx);
 }
 
-fn emitLogical(ctx: *EmitContext, op: IROp, opcode_byte: u8, opcode_rev: u8) void {
+fn emitLogical(ctx: *EmitContext, op: IROp, opcode_byte: u8) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
 
-    threeOp(ctx, dst, src0, opcode_byte, opcode_rev);
+    threeOp(ctx, dst, src0);
     const src1 = mapReg(ctx.regmap, op.src1);
 
     ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
@@ -307,6 +314,7 @@ fn emitLogical(ctx: *EmitContext, op: IROp, opcode_byte: u8, opcode_rev: u8) voi
 }
 
 fn emitNeg(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     ctx.rex(true, 0, 0, @intFromEnum(dst));
     ctx.byte(0xF7);
@@ -314,6 +322,7 @@ fn emitNeg(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitNot(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     ctx.rex(true, 0, 0, @intFromEnum(dst));
     ctx.byte(0xF7);
@@ -321,6 +330,7 @@ fn emitNot(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitDiv(ctx: *EmitContext, op: IROp, signed: bool) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
     const src1 = mapReg(ctx.regmap, op.src1);
@@ -357,6 +367,7 @@ fn emitMovCst(ctx: *EmitContext, dst: X86Reg, imm: u32) void {
 }
 
 fn emitShiftVar(ctx: *EmitContext, op: IROp, shift_type: u4) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     // Variable shift: count in CL
     ctx.rex(true, 0, 0, @intFromEnum(dst));
@@ -365,6 +376,7 @@ fn emitShiftVar(ctx: *EmitContext, op: IROp, shift_type: u4) void {
 }
 
 fn emitShiftImm(ctx: *EmitContext, op: IROp, shift_type: u4) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const amount = op.imm;
     if (amount == 1) {
@@ -381,58 +393,90 @@ fn emitShiftImm(ctx: *EmitContext, op: IROp, shift_type: u4) void {
 
 // ── Memory ─────────────────────────────────────────────────────────
 
-fn emitLoad(ctx: *EmitContext, op: IROp) void {
+fn emitLoad(ctx: *EmitContext, op: IROp, opcode: u8, rex_w: bool) void {
+    if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
     const base = mapReg(ctx.regmap, op.src0);
     const offset = op.imm;
 
+    const is_byte = opcode == 0x8A;
+    if (is_byte) {
+        // For 8-bit loads, always emit REX prefix (at minimum 0x40)
+        // to ensure low-byte registers (DIL, SIL, BPL, SPL) are used
+        // instead of legacy high-byte registers (AH, CH, DH, BH).
+        var rex_val: u8 = 0x40;
+        if (@intFromEnum(dst) & 0x08 != 0) rex_val |= 0x04;
+        if (@intFromEnum(base) & 0x08 != 0) rex_val |= 0x01;
+        ctx.byte(rex_val);
+    } else {
+        ctx.rex(rex_w, @intFromEnum(dst), 0, @intFromEnum(base));
+    }
+
     if (offset == 0) {
-        ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(base));
-        ctx.byte(0x8B);
+        ctx.byte(opcode);
         // RBP/R13 with mod=00 encodes as RIP-relative on x86-64. Use mod=01 + 0-displacement.
         if (@intFromEnum(base) & 0x07 == 0b101) {
-            ctx.modrm(0b01, @intFromEnum(dst), @intFromEnum(base));
+            ctx.modrm(1, @intFromEnum(dst), @intFromEnum(base));
             ctx.byte(0);
         } else {
-            ctx.modrm(0b00, @intFromEnum(dst), @intFromEnum(base));
+            ctx.modrm(0, @intFromEnum(dst), @intFromEnum(base));
         }
     } else if (offset <= 0x7F) {
-        ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(base));
-        ctx.byte(0x8B);
-        ctx.modrm(0b01, @intFromEnum(dst), @intFromEnum(base));
+        ctx.byte(opcode);
+        ctx.modrm(1, @intFromEnum(dst), @intFromEnum(base));
         ctx.byte(@truncate(offset));
     } else {
-        ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(base));
-        ctx.byte(0x8B);
-        ctx.modrm(0b10, @intFromEnum(dst), @intFromEnum(base));
+        ctx.byte(opcode);
+        // Manual ModRM: mod=10 (disp32), reg=dst, r/m=base
+        // (Using explicit arithmetic avoids R9 self-hosted backend bug
+        //  where `modrm(2, ...)` produces mod=11 instead of mod=10)
+        const d2: u8 = @intFromEnum(dst) & 7;
+        const b2: u8 = @intFromEnum(base) & 7;
+        ctx.byte(0x80 | (d2 << 3) | b2);
         ctx.bytes(std.mem.asBytes(&@as(i32, @bitCast(offset))));
     }
 }
 
-fn emitStore(ctx: *EmitContext, op: IROp) void {
+fn emitStore(ctx: *EmitContext, op: IROp, opcode: u8, rex_w: bool) void {
     const base_ = mapReg(ctx.regmap, op.src0);
+    // x8 maps to RAX via DefaultMapping, but stores use RAX as base for
+    // guest address computation. Redirect to R15 (reserved for SP, but used
+    // here as temporary). R15 is callee-saved and not otherwise used during
+    // emitStore.
     const base: X86Reg = if (base_ == .rax) .r15 else base_;
     const src = mapReg(ctx.regmap, op.src1);
     const offset = op.imm;
 
+    const is_byte = opcode == 0x88;
+    if (is_byte) {
+        // For 8-bit stores, always emit REX prefix (at minimum 0x40)
+        // to ensure low-byte registers (DIL, SIL, BPL, SPL) are used
+        // instead of legacy high-byte registers (AH, CH, DH, BH).
+        var rex_val: u8 = 0x40;
+        if (@intFromEnum(src) & 0x08 != 0) rex_val |= 0x04;
+        if (@intFromEnum(base) & 0x08 != 0) rex_val |= 0x01;
+        ctx.byte(rex_val);
+    } else {
+        ctx.rex(rex_w, @intFromEnum(src), 0, @intFromEnum(base));
+    }
+
     if (offset == 0) {
-        ctx.rex(true, @intFromEnum(src), 0, @intFromEnum(base));
-        ctx.byte(0x89);
+        ctx.byte(opcode);
         if (@intFromEnum(base) & 0x07 == 0b101) {
-            ctx.modrm(0b01, @intFromEnum(src), @intFromEnum(base));
+            ctx.modrm(1, @intFromEnum(src), @intFromEnum(base));
             ctx.byte(0);
         } else {
-            ctx.modrm(0b00, @intFromEnum(src), @intFromEnum(base));
+            ctx.modrm(0, @intFromEnum(src), @intFromEnum(base));
         }
     } else if (offset <= 0x7F) {
-        ctx.rex(true, @intFromEnum(src), 0, @intFromEnum(base));
-        ctx.byte(0x89);
-        ctx.modrm(0b01, @intFromEnum(src), @intFromEnum(base));
+        ctx.byte(opcode);
+        ctx.modrm(1, @intFromEnum(src), @intFromEnum(base));
         ctx.byte(@truncate(offset));
     } else {
-        ctx.rex(true, @intFromEnum(src), 0, @intFromEnum(base));
-        ctx.byte(0x89);
-        ctx.modrm(0b10, @intFromEnum(src), @intFromEnum(base));
+        ctx.byte(opcode);
+        const s2: u8 = @intFromEnum(src) & 7;
+        const b2: u8 = @intFromEnum(base) & 7;
+        ctx.byte(0x80 | (s2 << 3) | b2);
         ctx.bytes(std.mem.asBytes(&@as(i32, @bitCast(offset))));
     }
 }
@@ -441,14 +485,66 @@ fn emitStore(ctx: *EmitContext, op: IROp) void {
 
 fn emitBranch(ctx: *EmitContext, op: IROp) void {
     if (op.flags == 0) {
-        // JMP rel32=0 (placeholder), then RET for safe fallthrough
+        // Direct branch: JMP rel32 placeholder (patched by chaining)
         ctx.byte(0xE9);
         ctx.bytes(&[4]u8{ 0x00, 0x00, 0x00, 0x00 });
-        ctx.byte(0xC3); // RET
     } else {
+        // Indirect branch (BR Xn): emit L1 inline cache check + fallback.
+        // R14 = &runtime.l1_cache[0]; [R14-8] = indirect_target.
         const t = mapReg(ctx.regmap, op.src0);
+        const t_n = @intFromEnum(t);
+        const r11_n = @intFromEnum(X86Reg.r11);
+        const r14_n = @intFromEnum(X86Reg.r14);
+
+        // 1. MOV R11, t — copy target to R11 for hash+address
+        emitMovReg(ctx, .r11, t);
+
+        // 2. SHR R11, 2 — hash = target >> 2
+        ctx.rex(true, 0, 0, r11_n);
+        ctx.byte(0xC1);
+        ctx.modrm(0b11, 5, r11_n); // 5 = SHR opcode extension
+        ctx.byte(2);  // shift amount
+
+        // 3. AND R11, 63*16 = AND R11, 1008 (mask hash * entry_size 16)
+        // REX.W + 81 /4 id
+        ctx.rex(true, 0, 0, r11_n);
+        ctx.byte(0x81);
+        ctx.modrm(0b11, 4, r11_n);
+        ctx.bytes(std.mem.asBytes(&@as(i32, @intCast(@as(u32, 63 * 16)))));
+
+        // 4. CMP [R14 + R11], t — check if l1_cache[hash].guest_pc == target
+        // REX.W + REX.X(R11) + REX.B(R14): 0x48 | 0x02(R11>7?1:0) | 0x01(R14>7?1:0)
+        // For R11=11(0b1011) and R14=14(0b1110): X=1, B=1
+        const rex_cmp: u8 = 0x48 | @as(u8, if (r11_n > 7) 0x02 else 0) | @as(u8, if (r14_n > 7) 0x01 else 0);
+        ctx.byte(rex_cmp);
+        ctx.byte(0x39); // CMP r/m64, r64
+        // ModRM: mod=00, reg=t&7, rm=100(SIB)
+        ctx.modrm(0b00, t_n & 7, 0b100);
+        // SIB: scale=00(1), index=R11&7, base=R14&7
+        ctx.byte(@as(u8, (0 << 6) | ((r11_n & 7) << 3) | (r14_n & 7)));
+
+        // 5. JNE skip (rel8 = +5 to skip over JMP instruction)
+        ctx.byte(0x75);
+        ctx.byte(5); // jump forward 5 bytes
+
+        // 6. JMP [R14 + R11 + 8] — hit: jump to cached host address
+        const rex_jmp: u8 = 0x40 | @as(u8, if (r11_n > 7) 0x02 else 0) | @as(u8, if (r14_n > 7) 0x01 else 0);
+        if (rex_jmp != 0x40) ctx.byte(rex_jmp);
         ctx.byte(0xFF);
-        ctx.modrm(0b11, 4, @intFromEnum(t));
+        ctx.modrm(0b01, 4, 0b100); // mod=01(disp8), reg=4(JMP), rm=100(SIB)
+        ctx.byte(@as(u8, (0 << 6) | ((r11_n & 7) << 3) | (r14_n & 7)));
+        ctx.byte(8); // disp8 = +8
+
+        // 7. .miss: MOV [R14-8], t — store to indirect_target for runtime
+        // REX.W + REX.B(R14): 0x48 | 0x01
+        const rex_mov: u8 = 0x48 | @as(u8, if (r14_n > 7) 0x01 else 0);
+        ctx.byte(rex_mov);
+        ctx.byte(0x89);
+        ctx.modrm(0b01, t_n & 7, r14_n & 7);
+        ctx.byte(@as(u8, @bitCast(@as(i8, -8)))); // disp8 = -8
+
+        // 8. RET
+        ctx.byte(0xC3);
     }
 }
 
@@ -463,9 +559,46 @@ fn emitCall(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitCallReg(ctx: *EmitContext, op: IROp) void {
+    // BLR Xn: indirect call via register with same L1 cache as BR.
+    // The return address is handled by the block's store to state.x[30].
     const t = mapReg(ctx.regmap, op.src0);
+    const t_n = @intFromEnum(t);
+    const r11_n = @intFromEnum(X86Reg.r11);
+    const r14_n = @intFromEnum(X86Reg.r14);
+
+    // L1 inline cache: same as emitBranch indirect path
+    emitMovReg(ctx, .r11, t);
+    ctx.rex(true, 0, 0, r11_n);
+    ctx.byte(0xC1);
+    ctx.modrm(0b11, 5, r11_n);
+    ctx.byte(2);
+    ctx.rex(true, 0, 0, r11_n);
+    ctx.byte(0x81);
+    ctx.modrm(0b11, 4, r11_n);
+    ctx.bytes(std.mem.asBytes(&@as(i32, @intCast(@as(u32, 63 * 16)))));
+
+    const rex_cmp: u8 = 0x48 | @as(u8, if (r11_n > 7) 0x02 else 0) | @as(u8, if (r14_n > 7) 0x01 else 0);
+    ctx.byte(rex_cmp);
+    ctx.byte(0x39);
+    ctx.modrm(0b00, t_n & 7, 0b100);
+    ctx.byte(@as(u8, (0 << 6) | ((r11_n & 7) << 3) | (r14_n & 7)));
+
+    ctx.byte(0x75);
+    ctx.byte(5);
+
+    const rex_jmp: u8 = 0x40 | @as(u8, if (r11_n > 7) 0x02 else 0) | @as(u8, if (r14_n > 7) 0x01 else 0);
+    if (rex_jmp != 0x40) ctx.byte(rex_jmp);
     ctx.byte(0xFF);
-    ctx.modrm(0b11, 2, @intFromEnum(t));
+    ctx.modrm(0b01, 4, 0b100);
+    ctx.byte(@as(u8, (0 << 6) | ((r11_n & 7) << 3) | (r14_n & 7)));
+    ctx.byte(8);
+
+    const rex_mov: u8 = 0x48 | @as(u8, if (r14_n > 7) 0x01 else 0);
+    ctx.byte(rex_mov);
+    ctx.byte(0x89);
+    ctx.modrm(0b01, t_n & 7, r14_n & 7);
+    ctx.byte(@as(u8, @bitCast(@as(i8, -8))));
+    ctx.byte(0xC3);
 }
 
 fn emitRet(ctx: *EmitContext) void {
@@ -510,8 +643,12 @@ fn emitNZCVUpdate(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitNZCVRead(ctx: *EmitContext, op: IROp) void {
-    _ = ctx;
     _ = op;
+    // Materialize x86-64 RFLAGS into RAX so the next operation can read NZCV.
+    // This is needed when the IR emits nzcv_read without a preceding
+    // flag-setting instruction.
+    ctx.byte(0x9C); // PUSHFQ — push RFLAGS onto stack
+    ctx.byte(0x58); // POP RAX  — pop into RAX
 }
 
 // ── CCMP (conditional compare) ──────────────────────────────────────
@@ -606,7 +743,7 @@ fn emitCCmp(ctx: *EmitContext, op: IROp) void {
     // ── Condition NOT met path: set NZCV from immediate ──────────
     const else_path_start = ctx.offset;
     emitPushf(ctx);
-    emitPopf(ctx); // pop into RAX
+    ctx.byte(0x58); // POP RAX
     const mask = ~(@as(u32, 1) | (1 << 6) | (1 << 7) | (1 << 11)); // clear CF,ZF,SF,OF
     emitAndRaxImm(ctx, mask);
     const flags_val = nzcvToRflags(nzcv_val);
@@ -626,6 +763,142 @@ fn emitCCmp(ctx: *EmitContext, op: IROp) void {
     std.mem.writeInt(i32, ctx.buf[end_rel32_off..][0..4], end_rel32, .little);
 }
 
+// ── Atomic / exclusive ────────────────────────────────────────────
+
+fn emitLoadExcl(ctx: *EmitContext, op: IROp) void {
+    // On x86-64, exclusive load is the same as a regular load.
+    emitLoad(ctx, op, 0x8B, true);
+}
+
+fn emitStoreExcl(ctx: *EmitContext, op: IROp) void {
+    // On x86-64, exclusive store is a regular store + status=0 (always succeed).
+    // First, emit the store (same as store_u64 but with store_excl semantics).
+    emitStore(ctx, op, 0x89, true);
+
+    // Set status register (op.dest = Rs) to 0 (success).
+    if (isXzr(op.dest)) return;
+    const status = mapReg(ctx.regmap, op.dest);
+    ctx.rex(true, @intFromEnum(status), 0, @intFromEnum(status));
+    ctx.byte(0x31); // XOR r/m64, r64
+    ctx.modrm(0b11, @intFromEnum(status) & 7, @intFromEnum(status) & 7);
+}
+
+fn emitAtomicAdd(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
+    const addr_reg = mapReg(ctx.regmap, op.src0);
+    const val_reg = mapReg(ctx.regmap, op.src1);
+    const dst_reg = mapReg(ctx.regmap, op.dest);
+
+    ctx.byte(0xF0); // LOCK prefix
+    ctx.rex(true, @intFromEnum(val_reg), 0, @intFromEnum(addr_reg));
+    ctx.byte(0x0F);
+    ctx.byte(0xC1); // XADD r/m64, r64
+    ctx.modrm(0b00, @intFromEnum(val_reg) & 7, @intFromEnum(addr_reg) & 7);
+
+    // After XADD, val_reg holds the OLD value from memory.
+    if (dst_reg != val_reg) {
+        emitMovReg(ctx, dst_reg, val_reg);
+    }
+}
+
+fn emitAtomicCas(ctx: *EmitContext, op: IROp) void {
+    // CAS Xs, Xt, [Xn]: if ([Rn] == Rs) then [Rn] = Rt; Rt = old [Rn]
+    // x86 CMPXCHG: compares [addr] with RAX; if equal, [addr] = reg else RAX = [addr]
+    if (isXzr(op.dest)) return;
+
+    const addr_reg = mapReg(ctx.regmap, op.src0); // Rn
+    const expected_reg = mapReg(ctx.regmap, op.src1); // Rs
+    const new_val_reg = mapReg(ctx.regmap, op.dest); // Rt
+
+    // Expected value must be in RAX for CMPXCHG
+    if (expected_reg != .rax) {
+        emitMovReg(ctx, .rax, expected_reg);
+    }
+
+    ctx.byte(0xF0); // LOCK prefix
+    ctx.rex(true, @intFromEnum(new_val_reg), 0, @intFromEnum(addr_reg));
+    ctx.byte(0x0F);
+    ctx.byte(0xB1); // CMPXCHG r/m64, r64
+    ctx.modrm(0b00, @intFromEnum(new_val_reg) & 7, @intFromEnum(addr_reg) & 7);
+
+    // After CMPXCHG, RAX holds the old value from memory.
+    if (new_val_reg != .rax) {
+        emitMovReg(ctx, new_val_reg, .rax);
+    }
+}
+
+// ── FPCR/FPSR state access ────────────────────────────────────────
+// Arm64State is at offset 0 of JitRuntime. R14 points to JitRuntime.
+// Offsets computed from state.zig layout:
+//   x[31]:   0..247  (31 * 8)
+//   sp:      248
+//   pc:      256
+//   nzcv:    264 (u32)
+//   fpcr:    268 (u32)
+//   fpsr:    272 (u32)
+const STATE_FPCR_OFFSET: u16 = 268;
+const STATE_FPSR_OFFSET: u16 = 272;
+
+fn emitLoadFromState(ctx: *EmitContext, dst: X86Reg, offset: u16) void {
+    // MOV dst (32-bit, zero-extending), [R14 + offset]
+    const dst_n = @intFromEnum(dst);
+    const r14_n = @intFromEnum(X86Reg.r14);
+    var rex: u8 = 0x40;
+    if (dst_n > 7) rex |= 0x04; // REX.R
+    if (r14_n > 7) rex |= 0x01; // REX.B (always for R14=14)
+    if (rex != 0x40) ctx.byte(rex);
+    ctx.byte(0x8B);
+    if (offset <= 127) {
+        ctx.modrm(0b01, dst_n & 7, r14_n & 7);
+        ctx.byte(@truncate(offset));
+    } else {
+        ctx.modrm(0b10, dst_n & 7, r14_n & 7);
+        ctx.bytes(std.mem.asBytes(&@as(i32, @bitCast(@as(u32, offset)))));
+    }
+}
+
+fn emitStoreToState(ctx: *EmitContext, src: X86Reg, offset: u16) void {
+    // MOV [R14 + offset], src (32-bit store)
+    const src_n = @intFromEnum(src);
+    const r14_n = @intFromEnum(X86Reg.r14);
+    var rex: u8 = 0x40;
+    if (src_n > 7) rex |= 0x04; // REX.R
+    if (r14_n > 7) rex |= 0x01; // REX.B (always for R14=14)
+    if (rex != 0x40) ctx.byte(rex);
+    ctx.byte(0x89);
+    if (offset <= 127) {
+        ctx.modrm(0b01, src_n & 7, r14_n & 7);
+        ctx.byte(@truncate(offset));
+    } else {
+        ctx.modrm(0b10, src_n & 7, r14_n & 7);
+        ctx.bytes(std.mem.asBytes(&@as(i32, @bitCast(@as(u32, offset)))));
+    }
+}
+
+fn emitFpcrRead(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
+    const dst = mapReg(ctx.regmap, op.dest);
+    emitLoadFromState(ctx, dst, STATE_FPCR_OFFSET);
+}
+
+fn emitFpcrWrite(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.src0)) return;
+    const src = mapReg(ctx.regmap, op.src0);
+    emitStoreToState(ctx, src, STATE_FPCR_OFFSET);
+}
+
+fn emitFpsrRead(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
+    const dst = mapReg(ctx.regmap, op.dest);
+    emitLoadFromState(ctx, dst, STATE_FPSR_OFFSET);
+}
+
+fn emitFpsrWrite(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.src0)) return;
+    const src = mapReg(ctx.regmap, op.src0);
+    emitStoreToState(ctx, src, STATE_FPSR_OFFSET);
+}
+
 // ── Main dispatch ──────────────────────────────────────────────────
 
 pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
@@ -639,12 +912,13 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .div_u64, .div_s64 => emitDiv(ctx, op, op.tag == .div_s64),
         .mul_hi_s64 => emitMulHiS(ctx, op),
         .mul_hi_u64 => emitMulHiU(ctx, op),
-        .and_ => emitLogical(ctx, op, 0x21, 0x23),
-        .or_ => emitLogical(ctx, op, 0x09, 0x0B),
-        .xor_ => emitLogical(ctx, op, 0x31, 0x33),
+        .and_ => emitLogical(ctx, op, 0x21),
+        .or_ => emitLogical(ctx, op, 0x09),
+        .xor_ => emitLogical(ctx, op, 0x31),
         .not_ => emitNot(ctx, op),
         .neg_i64 => emitNeg(ctx, op),
         .mov_i64 => {
+            if (isXzr(op.dest)) return ctx.offset - start;
             const d = mapReg(ctx.regmap, op.dest);
             const s = mapReg(ctx.regmap, op.src0);
             emitMovReg(ctx, d, s);
@@ -656,8 +930,21 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .lshr_i64_imm => emitShiftImm(ctx, op, 5),
         .ashr_i64_imm => emitShiftImm(ctx, op, 7),
 
-        .load_u64 => emitLoad(ctx, op),
-        .store_u64 => emitStore(ctx, op),
+        .load_u64 => emitLoad(ctx, op, 0x8B, true),
+        .load_u32 => emitLoad(ctx, op, 0x8B, false),
+        .load_u16 => {
+            ctx.byte(0x66);
+            emitLoad(ctx, op, 0x8B, false);
+        },
+        .load_u8 => emitLoad(ctx, op, 0x8A, false),
+
+        .store_u64 => emitStore(ctx, op, 0x89, true),
+        .store_u32 => emitStore(ctx, op, 0x89, false),
+        .store_u16 => {
+            ctx.byte(0x66);
+            emitStore(ctx, op, 0x89, false);
+        },
+        .store_u8 => emitStore(ctx, op, 0x88, false),
 
         .br => emitBranch(ctx, op),
         .call => emitCall(ctx, op),
@@ -670,6 +957,8 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .nzcv_read => emitNZCVRead(ctx, op),
 
         .sp_get => {
+            if (isXzr(op.dest)) return ctx.offset - start;
+            // SP lives in R15 before block call; preserved by sp_put.
             const dst = mapReg(ctx.regmap, op.dest);
             emitMovReg(ctx, dst, .r15);
         },
@@ -678,6 +967,18 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
             emitMovReg(ctx, .r15, src);
         },
 
+        // ── Atomic / exclusive ─────────────────────────────────
+        .load_excl => emitLoadExcl(ctx, op),
+        .store_excl => emitStoreExcl(ctx, op),
+        .atomic_add => emitAtomicAdd(ctx, op),
+        .atomic_cas => emitAtomicCas(ctx, op),
+
+        // ── FPCR / FPSR ────────────────────────────────────────
+        .fpcr_read => emitFpcrRead(ctx, op),
+        .fpcr_write => emitFpcrWrite(ctx, op),
+        .fpsr_read => emitFpsrRead(ctx, op),
+        .fpsr_write => emitFpsrWrite(ctx, op),
+
         else => ctx.byte(0xCC),
     }
     return ctx.offset - start;
@@ -685,36 +986,10 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
 
 pub fn emitBlock(buf: []u8, regmap: *const RegisterMap, ops: []const IROp) []u8 {
     var ctx = EmitContext.init(buf, regmap);
-    // Prologue: load R14 with state pointer (slot patched at translation)
-    ctx.byte(0x49); ctx.byte(0xBE);
-    ctx.bytes(&[8]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
-    // Load all mapped host regs from state via R14
-    for (regmap.*, 0..) |maybe_host, arm_i| {
-        const host = maybe_host orelse continue;
-        if (arm_i == 8) continue;
-        const off: u32 = @as(u32, @intCast(arm_i)) * 8;
-        if (off < 128) {
-            ctx.rex(true, @intFromEnum(host), 0, @intFromEnum(X86Reg.r14));
-            ctx.byte(0x8B);
-            ctx.modrm(0b01, @intFromEnum(host), @intFromEnum(X86Reg.r14));
-            ctx.byte(@intCast(off));
-        } else {
-            ctx.rex(true, @intFromEnum(host), 0, @intFromEnum(X86Reg.r14));
-            ctx.byte(0x8B);
-            ctx.modrm(0b10, @intFromEnum(host), @intFromEnum(X86Reg.r14));
-            ctx.disp32(@intCast(off));
-        }
-    }
-    // x8 at offset 64
-    if (regmap[8] != null) {
-        ctx.rex(true, @intFromEnum(X86Reg.rax), 0, @intFromEnum(X86Reg.r14));
-        ctx.byte(0x8B);
-        ctx.modrm(0b01, @intFromEnum(X86Reg.rax), @intFromEnum(X86Reg.r14));
-        ctx.byte(64);
-    }
     for (ops) |op| _ = emitOp(&ctx, op);
     if (ctx.offset == 0) emitRet(&ctx);
-    return buf[0..ctx.offset];
+    const optimized_len = Peephole.optimize(buf, ctx.offset);
+    return buf[0..optimized_len];
 }
 
 // ── Trampoline ─────────────────────────────────────────────────────

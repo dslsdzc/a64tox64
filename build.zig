@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
         .name = "a64tox64",
         .root_module = root_module,
     });
+    root_module.linkSystemLibrary("dl", .{});
+    root_module.linkSystemLibrary("LLVM-22", .{});
+    root_module.link_libcpp = true;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -29,6 +32,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    test_module.linkSystemLibrary("LLVM-22", .{});
+    test_module.link_libcpp = true;
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,

@@ -8,12 +8,11 @@ pub const state = @import("state.zig");
 pub const decode = @import("decode.zig");
 pub const ir_builder = @import("ir_builder.zig");
 pub const emit = @import("emit.zig");
-pub const emit_direct = @import("emit_direct.zig");
+
 pub const block = @import("block.zig");
 pub const cache = @import("cache.zig");
 pub const runtime = @import("runtime.zig");
 pub const elf = @import("elf.zig");
-pub const thunk = @import("thunk.zig");
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -50,8 +49,8 @@ pub fn main() !void {
     defer jit.deinit();
     try jit.loadElf(mapped);
     std.posix.munmap(mapped);
-    jit.execute(jit.state.pc);
+    jit.execute(jit.state.pc, 0);
     linux.exit(@as(i32, @intCast(jit.state.x[0] & 0xFF)));
 }
 
-test { _ = ir; _ = state; _ = decode; _ = ir_builder; _ = emit; _ = emit_direct; _ = block; _ = cache; _ = runtime; _ = elf; }
+test { _ = ir; _ = state; _ = decode; _ = ir_builder; _ = emit; _ = block; _ = cache; _ = runtime; _ = elf; }

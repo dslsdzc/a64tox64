@@ -30,6 +30,9 @@ pub const Arm64State = struct {
     /// SIMD/FP registers v0-v31 (128-bit NEON)
     v: [32]u128,
 
+    /// TLS pointer register (TPIDR_EL0) — user-space thread-local storage.
+    tpidr_el0: u64,
+
     pub fn init() Arm64State {
         return std.mem.zeroes(Arm64State);
     }

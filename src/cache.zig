@@ -55,6 +55,11 @@ pub const CodeCache = struct {
     }
 
     pub fn invalidatePage(cache: *CodeCache, guest_page_start: u64) void {
+        // Note: GDB JIT entries for invalidated blocks are not cleaned up here.
+        // In the future, GdbJit.removeBatch() could be called to remove stale
+        // GDB JIT entries when a batch's blocks are invalidated, but tracking
+        // which batch a block belongs to adds complexity. For now, GDB JIT only
+        // adds entries — stale entries remain visible in GDB (harmless).
         const aligned = guest_page_start & ~@as(u64, 0xFFF);
         var it = cache.map.iterator();
         var keys: [64]u64 = undefined;

@@ -8,6 +8,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const Tag = enum(u16) {
+    // Note: _i32 variants are defined for completeness but ir_builder currently
+    // emits only _i64 variants. The 32-bit tags exist for future use (e.g., when
+    // the decoder extracts the sf=0 encoding for explicit 32-bit operations).
     // ── ALU integer ─────────────────────────────────────────────────
     add_i32,
     add_i64,
@@ -64,14 +67,109 @@ pub const Tag = enum(u16) {
     ccmp,
 
     // ── SIMD / FP ────────────────────────────────────────────────────
-    vadd,
+    // Integer vector arithmetic
+    vadd,    // with long/wide/narrow/saturating variant in flags
     vsub,
     vmul,
+    vmla,    // multiply-accumulate
+    vmls,    // multiply-subtract
+    vabs,    // absolute value
+    vneg,
+    vmin,
+    vmax,
+    vabd,    // absolute difference
+    vpadd,   // pairwise add
+    vpmin,
+    vpmax,
+    vqadd,   // saturating add
+    vqsub,   // saturating sub
+    vaddlp,  // pairwise add long
+    vaddlv,  // pairwise add long across vector
+    vabdl,   // absolute difference long
+
+    // Float vector arithmetic
     vfadd,
+    vfsub,
     vfmul,
-    vshl,
+    vfdiv,
+    vfma,    // fused multiply-add
+    vfms,    // fused multiply-sub
+    vfmin,
+    vfmax,
+    vfabs,
+    vfneg,
+    vfrecpe, // reciprocal estimate
+    vfrecps, // reciprocal step
+    vfsqrt,
+    vfmulx,  // multiply extended
+
+    // Integer compare
+    vceq,
+    vcgt,
+    vcge,
+
+    // Float compare
+    vfcmp,
+
+    // Vector shift
+    vshl,    // with saturating/rounding variant in flags
     vshr,
-    fcvt,
+    vsra,    // shift right and accumulate
+    vsri,    // shift right and insert
+    vsli,    // shift left and insert
+    vqshl,   // saturating shift left
+    vqshlu,  // saturating shift left unsigned (for signed->unsigned)
+    vrshr,   // rounding shift right
+    vshrn,   // shift right and narrow
+    vrshrn,  // rounding shift right narrow
+
+    // Conversion
+    fcvt,    // float-to-float size change
+    fcvtzs,  // float to signed int
+    fcvtzu,  // float to unsigned int
+    scvtf,   // signed int to float
+    ucvtf,   // unsigned int to float
+    fcvtl,   // float long (f16→f32, f32→f64)
+    fcvtn,   // float narrow (f32→f16, f64→f32)
+    xtn,     // narrow integer (i16→i8, i32→i16, i64→i32)
+    uxtl,    // unsigned extend long
+    sxtl,    // signed extend long
+
+    // Permute / data manipulation
+    vext,    // extract vector from pair
+    vtrn,    // transpose
+    vuzp,    // de-interleave
+    vzip,    // interleave
+    vrev16,  // reverse within 16-bit elements
+    vrev32,  // reverse within 32-bit elements
+    vrev64,  // reverse within 64-bit elements
+    vdup,    // broadcast scalar to all lanes
+    vtbl,    // table lookup (1-4 registers)
+    vtbx,    // table lookup with background
+
+    // Logical
+    vand,
+    vorr,
+    veor,
+    vbic,    // bitwise clear
+    vorn,    // bitwise nor
+    vbsl,    // bitwise select
+
+    // Load / store extra
+    load_v64,   // 64-bit vector load (D-register)
+    store_v64,  // 64-bit vector store
+
+    // ── Atomic / exclusive ───────────────────────────────────────────
+    load_excl,   // load with exclusive monitor (on x86 just a regular load)
+    store_excl,  // store exclusive; dst=status (0=success, always success on x86)
+    atomic_add,  // atomic add: mem[src0] += src1; uses LOCK XADD on x86
+    atomic_cas,  // atomic CAS: if mem[src0]==src1 then mem[src0]=dest; uses LOCK CMPXCHG
+
+    // ── FPCR / FPSR ─────────────────────────────────────────────────
+    fpcr_read,   // read FPCR into dest register
+    fpcr_write,  // write FPCR from src0
+    fpsr_read,   // read FPSR into dest register
+    fpsr_write,  // write FPSR from src0
 
     // ── Meta ─────────────────────────────────────────────────────────
     sp_get, // R15 → dst
@@ -95,6 +193,33 @@ pub const IROp = packed struct {
     comptime {
         assert(@sizeOf(IROp) == 16);
     }
+};
+
+// ── SIMD element type encoding (stored in flags bits 0-2) ─────
+pub const VecElem = enum(u3) {
+    i8 = 0,
+    i16 = 1,
+    i32 = 2,
+    i64 = 3,
+    f16 = 4,
+    f32 = 5,
+    f64 = 6,
+};
+
+/// SIMD flags helpers.
+pub const VecFlags = struct {
+    /// Extract element type from flags.
+    pub fn elemType(flags: u16) VecElem {
+        return @enumFromInt(@as(u3, @truncate(flags & 7)));
+    }
+    /// Encode element type into flags (preserves other bits).
+    pub fn withElem(flags: u16, et: VecElem) u16 {
+        return (flags & ~@as(u16, 7)) | @as(u16, @intFromEnum(et));
+    }
+    /// Check if operation variant is "long" (flags bit 4).
+    pub fn isLong(flags: u16) bool { return flags & 0x10 != 0; }
+    pub fn isWide(flags: u16) bool { return flags & 0x20 != 0; }
+    pub fn isNarrow(flags: u16) bool { return flags & 0x40 != 0; }
 };
 
 /// A growable buffer of IR ops.
