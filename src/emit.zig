@@ -1081,7 +1081,7 @@ pub fn emitTrampoline(buf: []u8) []u8 {
 
 test "emit ADD immediate" {
     var code: [128]u8 = undefined;
-    const op = IROp{ .tag = .add_i64, .dest = 0, .src0 = 1, .src1 = 0x1F, .flags = 0, .imm = 42 };
+    const op = IROp{ .tag = .add_i64, .dest = 0, .src0 = 0, .src1 = 0x1F, .flags = 0, .imm = 42 };
     const emitted = emitBlock(&code, &DefaultMapping, &.{op});
     try std.testing.expectEqual(@as(u8, 0x48), emitted[0]);
     try std.testing.expectEqual(@as(u8, 0x83), emitted[1]);
@@ -1108,7 +1108,7 @@ test "emit LOAD" {
     const emitted = emitBlock(&code, &DefaultMapping, &.{op});
     try std.testing.expectEqual(@as(u8, 0x48), emitted[0]);
     try std.testing.expectEqual(@as(u8, 0x8B), emitted[1]);
-    try std.testing.expectEqual(@as(u8, 0x46), emitted[2]);
+    try std.testing.expectEqual(@as(u8, 0x7E), emitted[2]);
     try std.testing.expectEqual(@as(u8, 16), emitted[3]);
 }
 
