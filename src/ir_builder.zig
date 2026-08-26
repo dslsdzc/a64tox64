@@ -1024,7 +1024,7 @@ test "UBFM (UXTB) → IR" {
     defer buf.deinit(std.testing.allocator);
     // UBFM X0, X1, #0, #7 → UXTB: AND with 0xFF
     // Encoding: sf=1, N=1, opc=10, immr=0, imms=7, rn=1, rd=0
-    const inst = Decode.decode(0x13001C20);
+    const inst = Decode.decode(0xD3401C20);
     try build(&buf, std.testing.allocator, inst, 0);
     try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);
     try std.testing.expectEqual(Tag.and_, buf.ops.items[0].tag);
@@ -1036,7 +1036,7 @@ test "SBFM (SXTB) → IR" {
     defer buf.deinit(std.testing.allocator);
     // SBFM X0, X1, #0, #7 → SXTB: LSL 56, ASR 56
     // Encoding: sf=1, N=1, opc=00, immr=0, imms=7, rn=1, rd=0
-    const inst = Decode.decode(0x13001C00);
+    const inst = Decode.decode(0x93401C20);
     try build(&buf, std.testing.allocator, inst, 0);
     try std.testing.expectEqual(@as(usize, 2), buf.ops.items.len);
     try std.testing.expectEqual(Tag.lshl_i64_imm, buf.ops.items[0].tag);

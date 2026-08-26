@@ -278,8 +278,10 @@ fn decodeOpcode(raw: u32) Opcode {
     if ((raw & 0xFFE00000) == 0x9B400000 and (raw & 0x0000FC00) == 0x00007C00) return .smulh;
     if ((raw & 0xFFE00000) == 0x9BC00000 and (raw & 0x0000FC00) == 0x00007C00) return .umulh;
 
-    // EXTR (extract register): bits 30-24 = 00|10011, bit 22 = 0
-    if ((raw & 0x7F400000) == 0x13000000) return .extr;
+    // EXTR (extract register): bits 30-24 = 00|10011, bit 23 = 1, bit 22 = N (0 for 32-bit)
+    // Bit 23 = 1 distinguishes EXTR from SBFM (bits 28-23 = 100111 vs 100110)
+    if ((raw & 0xFFE00000) == 0x13800000) return .extr;  // EXTR 32-bit (N=0)
+    if ((raw & 0xFFE00000) == 0x93C00000) return .extr;  // EXTR 64-bit (N=1)
 
     // ── Advanced SIMD (NEON) — catch major encoding spaces ──────────
     // bits 31-28 = 0x0, bit 27-24 = 0xE/0xF/0x2E/0x3E → group in {0xE, 0x1E, 0x2E, 0x3E}
@@ -437,10 +439,10 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0x7FE00000, .value = 0x9AC02C00, .opcode = .ror_reg },  // RORV (64-bit)
 
     // ── Bitfield ───────────────────────────────────────────────
-    .{ .mask = 0xFF800000, .value = 0x13000000, .opcode = .ubfm },     // UBFM (32-bit)
-    .{ .mask = 0xFF800000, .value = 0x93400000, .opcode = .ubfm },     // UBFM (64-bit)
-    .{ .mask = 0xFF800000, .value = 0x12000000, .opcode = .sbfm },     // SBFM (32-bit)
-    .{ .mask = 0xFF800000, .value = 0x94000000, .opcode = .sbfm },     // SBFM (64-bit)
+    .{ .mask = 0xFF800000, .value = 0x53000000, .opcode = .ubfm },     // UBFM (32-bit)
+    .{ .mask = 0xFF800000, .value = 0xD3000000, .opcode = .ubfm },     // UBFM (64-bit)
+    .{ .mask = 0xFF800000, .value = 0x13000000, .opcode = .sbfm },     // SBFM (32-bit)
+    .{ .mask = 0xFF800000, .value = 0x93000000, .opcode = .sbfm },     // SBFM (64-bit)
     .{ .mask = 0xFF800000, .value = 0x33000000, .opcode = .bfm },      // BFM (32-bit)
     .{ .mask = 0xFF800000, .value = 0xB3000000, .opcode = .bfm },      // BFM (64-bit)
 
@@ -924,6 +926,29 @@ test "decode unknown instruction" {
     // An unallocated encoding
     const inst = decode(0x00000000);
     try std.testing.expectEqual(Opcode.unknown, inst.opcode);
+}
+
+test "decode UBFM/SBFM/BFM/EXTR (llvm-mc ground truth)" {
+    // UBFM X0, X1, #0, #7 (ubfx x0, x1, #0, #8) → 0xD3401C20
+    const ubfm64 = decode(0xD3401C20);
+    try std.testing.expectEqual(Opcode.ubfm, ubfm64.opcode);
+    try std.testing.expectEqual(@as(u6, 0), ubfm64.operands.bitfield.immr);
+    try std.testing.expectEqual(@as(u6, 7), ubfm64.operands.bitfield.imms);
+    // SBFM X0, X1, #0, #7 (sxtb x0, w1) → 0x93401C20
+    const sbfm64 = decode(0x93401C20);
+    try std.testing.expectEqual(Opcode.sbfm, sbfm64.opcode);
+    try std.testing.expectEqual(@as(u6, 0), sbfm64.operands.bitfield.immr);
+    try std.testing.expectEqual(@as(u6, 7), sbfm64.operands.bitfield.imms);
+    // SBFM W0, W1, #0, #7 (sxtb w0, w1) → 0x13001C20 must NOT fall into EXTR space
+    try std.testing.expectEqual(Opcode.sbfm, decode(0x13001C20).opcode);
+    // BFM X0, X1, #0, #7 (bfxil x0, x1, #0, #8) → 0xB3401C20
+    try std.testing.expectEqual(Opcode.bfm, decode(0xB3401C20).opcode);
+    // EXTR 64-bit X0, X1, X2, #7 → 0x93C21C20
+    const extr64 = decode(0x93C21C20);
+    try std.testing.expectEqual(Opcode.extr, extr64.opcode);
+    try std.testing.expectEqual(@as(u5, 2), extr64.operands.rrr.rm);
+    // EXTR 32-bit W0, W1, W2, #7 → 0x13821C20
+    try std.testing.expectEqual(Opcode.extr, decode(0x13821C20).opcode);
 }
 
 test "decode LDR X0, [X1, #16]" {
