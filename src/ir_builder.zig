@@ -1279,31 +1279,34 @@ pub fn buildNeonPerm(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst
     const rd: u16 = @truncate(raw & 0x1F);
     const rn: u16 = @truncate((raw >> 5) & 0x1F);
     // Q bit extraction: depends on top-byte encoding
-    // Permute/two-reg-misc use top byte 0x2E/0x6E (Q at bit30)
+    // Permute (UZP/TRN/ZIP) uses top byte 0x0E/0x4E, REV32 uses 0x2E/0x6E (Q at bit30)
     // DUP uses top byte 0x0E/0x4E  (Q at bit30 too)
 
-    // ── REV64: 0 Q 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 size 1 0 0 0 Rn Rd ──
-    // opcode=0000, bit13=1, bits12-10=000
-    if (((raw >> 24) & 0xFE) == 0x2E and ((raw >> 16) & 0xFF) == 0x00 and ((raw >> 10) & 0x0F) == 0x08) {
+    // ── REV64: two-register misc, U=0, opcode 00000, size at bits 23-22 ──
+    // bits31-24 = 0 0 Q 0 1 1 1 0 (0x0E/0x4E), bit21 = 1, bits20-16 = 00000,
+    // bits15-12 = 0000, bits11-10 = 10 (REV64 V0.8B = 0x0E200820, llvm-mc ground truth)
+    if (((raw >> 24) & 0xBF) == 0x0E and (raw & 0x003F0000) == 0x00200000 and (raw & 0x0000FC00) == 0x00000800) {
         const rq: u1 = @truncate(raw >> 30);
-        const rev_size: u2 = @truncate(raw >> 14);
+        const rev_size: u2 = @truncate(raw >> 22);
         if (rev_size <= 2) {
             try emitNeonUnop(buf, allocator, .vrev64, rd, rn, neonFlags(rev_size, rq, 0));
             return;
         }
     }
-    // REV32: opcode=0001, bit13=1, size=01 only
-    if (((raw >> 24) & 0xFE) == 0x2E and ((raw >> 16) & 0xFF) == 0x00 and ((raw >> 10) & 0x0F) == 0x08 and ((raw >> 12) & 0x30) == 0x10) {
+    // REV32: two-register misc, U=1, opcode 00000, size 01/10 (V0.4H = 0x2E600820)
+    if (((raw >> 24) & 0xBF) == 0x2E and (raw & 0x003F0000) == 0x00200000 and (raw & 0x0000FC00) == 0x00000800) {
         const rq: u1 = @truncate(raw >> 30);
-        if (((raw >> 14) & 0x3) == 1) {
-            try emitNeonUnop(buf, allocator, .vrev32, rd, rn, neonFlags(1, rq, 0));
+        const rev_size: u2 = @truncate(raw >> 22);
+        if (rev_size == 1 or rev_size == 2) {
+            try emitNeonUnop(buf, allocator, .vrev32, rd, rn, neonFlags(rev_size, rq, 0));
             return;
         }
     }
-    // REV16: opcode=0010, bit13=1, size=00 only
-    if (((raw >> 24) & 0xFE) == 0x2E and ((raw >> 16) & 0xFF) == 0x00 and ((raw >> 10) & 0x0F) == 0x08 and ((raw >> 12) & 0x30) == 0x20) {
+    // REV16: two-register misc, U=0, opcode 00001, size 00 only (V0.8B = 0x0E201820)
+    if (((raw >> 24) & 0xBF) == 0x0E and (raw & 0x003F0000) == 0x00200000 and (raw & 0x0000FC00) == 0x00001800) {
         const rq: u1 = @truncate(raw >> 30);
-        if (((raw >> 14) & 0x3) == 0) {
+        const rev_size: u2 = @truncate(raw >> 22);
+        if (rev_size == 0) {
             try emitNeonUnop(buf, allocator, .vrev16, rd, rn, neonFlags(0, rq, 0));
             return;
         }
@@ -1510,10 +1513,10 @@ test "NEON: SUB vector via buildNeonSame" {
 }
 
 test "NEON: REV64 via buildNeonPerm" {
-    // REV64 V0.8B, V1.8B → 0x2E002020
+    // REV64 V0.8B, V1.8B → 0x0E200820
     var buf: IRBuffer = .{};
     defer buf.deinit(std.testing.allocator);
-    const inst = Decode.decode(0x2E002020);
+    const inst = Decode.decode(0x0E200820);
     try std.testing.expectEqual(Opcode.neon_perm, inst.opcode);
     try build(&buf, std.testing.allocator, inst, 0);
     try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);
@@ -1532,10 +1535,10 @@ test "NEON: LD1 via buildNeonLdSt" {
 }
 
 test "NEON: ADDL via buildNeonDiff" {
-    // ADDL V0.8H, V1.8B, V2.8B → 0x0E202820
+    // SADDL V0.8H, V1.8B, V2.8B → 0x0E220020
     var buf: IRBuffer = .{};
     defer buf.deinit(std.testing.allocator);
-    const inst = Decode.decode(0x0E202820);
+    const inst = Decode.decode(0x0E220020);
     try std.testing.expectEqual(Opcode.neon_diff, inst.opcode);
     try build(&buf, std.testing.allocator, inst, 0);
     // Should produce 1 IR op or fall through silently
