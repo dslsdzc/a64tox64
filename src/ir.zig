@@ -57,6 +57,8 @@ pub const Tag = enum(u16) {
     lshl_i64_imm,
     lshr_i64_imm,
     ashr_i64_imm,
+    clz,     // count leading zeros: dest ← clz(src0); flags = data size code (2=32-bit, 3=64-bit)
+    crc32,   // CRC-32C (Castagnoli): dest ← crc32(src0, src1); flags = data size code (0=8,1=16,2=32,3=64)
 
     // ── Control flow ─────────────────────────────────────────────────
     br,

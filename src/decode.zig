@@ -416,8 +416,11 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0x7FE00000, .value = 0x9AC00800, .opcode = .udiv },     // UDIV (64-bit)
 
     // CLZ (count leading zeros)
-    .{ .mask = 0x7FE0FC00, .value = 0x1AC01000, .opcode = .clz },      // CLZ (32-bit)
-    .{ .mask = 0x7FE0FC00, .value = 0xDAC01000, .opcode = .clz },      // CLZ (64-bit)
+    // llvm-mc ground truth: clz w0, w1 → 0x5AC01020, clz x0, x1 → 0xDAC01020.
+    // (Previous values 0x1AC01000/0xDAC01000 never matched any real encoding:
+    //  bit 31 is not masked but is set in the value, and bit 30 is wrong.)
+    .{ .mask = 0x7FE0FC00, .value = 0x5AC01000, .opcode = .clz },      // CLZ (32-bit)
+    .{ .mask = 0xFFE0FC00, .value = 0xDAC01000, .opcode = .clz },      // CLZ (64-bit)
     // DMB/DSB/ISB memory barriers (nops on x86 in user mode)
     .{ .mask = 0xFFFFF0FF, .value = 0xD50330BF, .opcode = .dmb },      // DMB
     .{ .mask = 0xFFFFF0FF, .value = 0xD503309F, .opcode = .dsb },      // DSB
@@ -930,6 +933,18 @@ test "decode unknown instruction" {
     // An unallocated encoding
     const inst = decode(0x00000000);
     try std.testing.expectEqual(Opcode.unknown, inst.opcode);
+}
+
+test "decode CLZ (llvm-mc ground truth)" {
+    // llvm-mc: clz x0, x1 → 0xDAC01020; clz w0, w1 → 0x5AC01020
+    const clz64 = decode(0xDAC01020);
+    try std.testing.expectEqual(Opcode.clz, clz64.opcode);
+    try std.testing.expectEqual(@as(u5, 0), clz64.operands.rrr.rd);
+    try std.testing.expectEqual(@as(u5, 1), clz64.operands.rrr.rn);
+    try std.testing.expect(clz64.sf);
+    const clz32 = decode(0x5AC01020);
+    try std.testing.expectEqual(Opcode.clz, clz32.opcode);
+    try std.testing.expect(!clz32.sf);
 }
 
 test "decode UBFM/SBFM/BFM/EXTR (llvm-mc ground truth)" {

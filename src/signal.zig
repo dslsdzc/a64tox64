@@ -19,6 +19,12 @@ var saved_cache: ?*CodeCache = null;
 pub var pending_signal: i32 = -1;
 pub var pending_fault_addr: u64 = 0;
 
+/// Incremented on every SMC invalidation. The runtime compares this against
+/// its own copy at block-lookup time and syncs its L2 cache when it changes.
+pub var invalidation_generation: u32 = 0;
+/// Guest page (page-aligned) invalidated by the most recent SMC event.
+pub var last_invalidated_page: u64 = 0;
+
 
 const MAX_BLOCK_ENTRIES = 4096;
 var block_ranges: [MAX_BLOCK_ENTRIES]BlockRange = undefined;
@@ -116,6 +122,10 @@ fn invalidateGuestPage(guest_page: u64) usize {
     if (saved_cache) |cache| {
         cache.invalidatePage(guest_page);
     }
+    // Notify the runtime so it can clear stale L2 cache entries for this
+    // page on its next block lookup (see runtime.executeInner).
+    invalidation_generation +%= 1;
+    last_invalidated_page = guest_page & ~@as(u64, 0xFFF);
     return count;
 }
 

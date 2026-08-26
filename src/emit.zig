@@ -329,6 +329,91 @@ fn emitNot(ctx: *EmitContext, op: IROp) void {
     ctx.modrm(0b11, 2, @intFromEnum(dst)); // NOT r/m64
 }
 
+fn emitClz(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
+    const dst = mapReg(ctx.regmap, op.dest);
+    const is64 = op.flags == 3;
+    // LZCNT r64/r32, r/m: F3 (REX.W) 0F BD /r.
+    // Zero input returns the operand width (64 or 32), matching ARM64 CLZ.
+    if (isXzr(op.src0)) {
+        // XZR reads as zero: XOR dst,dst then LZCNT dst,dst → result = width.
+        ctx.rex(is64, 0, 0, @intFromEnum(dst));
+        ctx.byte(0x31);
+        ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(dst));
+        ctx.byte(0xF3);
+        ctx.rex(is64, @intFromEnum(dst), 0, @intFromEnum(dst));
+        ctx.byte(0x0F);
+        ctx.byte(0xBD);
+        ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(dst));
+        return;
+    }
+    const src0 = mapReg(ctx.regmap, op.src0);
+    ctx.byte(0xF3);
+    ctx.rex(is64, @intFromEnum(dst), 0, @intFromEnum(src0));
+    ctx.byte(0x0F);
+    ctx.byte(0xBD);
+    ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(src0));
+}
+
+fn emitCrc32(ctx: *EmitContext, op: IROp) void {
+    if (isXzr(op.dest)) return;
+    const dst = mapReg(ctx.regmap, op.dest);
+    // x86 CRC32 accumulates into its destination, so seed it with src0 first:
+    //   MOV dst, src0 ; CRC32 dst, src1   (dst = CRC32(src0, src1))
+    if (isXzr(op.src0)) {
+        // XZR seed = 0: XOR dst,dst
+        ctx.rex(true, 0, 0, @intFromEnum(dst));
+        ctx.byte(0x31);
+        ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(dst));
+    } else {
+        threeOp(ctx, dst, mapReg(ctx.regmap, op.src0));
+    }
+    // XZR as data source maps to RAX (garbage) — accepted limitation, matches
+    // how other ops treat XZR sources; CRC32 with XZR data is pathological.
+    const src1 = mapReg(ctx.regmap, op.src1);
+    const size: u2 = @truncate(op.flags);
+    switch (size) {
+        0 => { // CRC32 r32, r/m8: F2 (REX) 0F 38 F0 /r
+            ctx.byte(0xF2);
+            // Always emit a REX prefix (min 0x40) so r/m8 regs in the
+            // rsp/rbp/rsi/rdi range decode as SPL/BPL/SIL/DIL, not AH/BH/CH/DH.
+            var rex_val: u8 = 0x40;
+            if (@intFromEnum(dst) & 0x08 != 0) rex_val |= 0x04;
+            if (@intFromEnum(src1) & 0x08 != 0) rex_val |= 0x01;
+            ctx.byte(rex_val);
+            ctx.byte(0x0F);
+            ctx.byte(0x38);
+            ctx.byte(0xF0);
+            ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(src1));
+        },
+        1 => { // CRC32 r32, r/m16: 66 F2 0F 38 F1 /r
+            ctx.byte(0x66);
+            ctx.byte(0xF2);
+            ctx.rex(false, @intFromEnum(dst), 0, @intFromEnum(src1));
+            ctx.byte(0x0F);
+            ctx.byte(0x38);
+            ctx.byte(0xF1);
+            ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(src1));
+        },
+        2 => { // CRC32 r32, r/m32: F2 0F 38 F1 /r
+            ctx.byte(0xF2);
+            ctx.rex(false, @intFromEnum(dst), 0, @intFromEnum(src1));
+            ctx.byte(0x0F);
+            ctx.byte(0x38);
+            ctx.byte(0xF1);
+            ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(src1));
+        },
+        3 => { // CRC32 r64, r/m64: F2 48 0F 38 F1 /r
+            ctx.byte(0xF2);
+            ctx.rex(true, @intFromEnum(dst), 0, @intFromEnum(src1));
+            ctx.byte(0x0F);
+            ctx.byte(0x38);
+            ctx.byte(0xF1);
+            ctx.modrm(0b11, @intFromEnum(dst), @intFromEnum(src1));
+        },
+    }
+}
+
 fn emitDiv(ctx: *EmitContext, op: IROp, signed: bool) void {
     if (isXzr(op.dest)) return;
     const dst = mapReg(ctx.regmap, op.dest);
@@ -929,6 +1014,8 @@ pub fn emitOp(ctx: *EmitContext, op: IROp) usize {
         .lshl_i64_imm => emitShiftImm(ctx, op, 4),
         .lshr_i64_imm => emitShiftImm(ctx, op, 5),
         .ashr_i64_imm => emitShiftImm(ctx, op, 7),
+        .clz => emitClz(ctx, op),
+        .crc32 => emitCrc32(ctx, op),
 
         .load_u64 => emitLoad(ctx, op, 0x8B, true),
         .load_u32 => emitLoad(ctx, op, 0x8B, false),
@@ -1118,4 +1205,42 @@ test "emit NOT" {
     const emitted = emitBlock(&code, &DefaultMapping, &.{op});
     try std.testing.expectEqual(@as(u8, 0x48), emitted[0]);
     try std.testing.expectEqual(@as(u8, 0xF7), emitted[1]);
+}
+
+test "emit CLZ (LZCNT r64)" {
+    var code: [128]u8 = undefined;
+    // CLZ X0, X1 → LZCNT RDI, RSI = F3 48 0F BD FE
+    // (LZCNT encodes the dest in the ModRM reg field; objdump-verified)
+    const op = IROp{ .tag = .clz, .dest = 0, .src0 = 1, .src1 = 0x1F, .flags = 3, .imm = 0 };
+    const emitted = emitBlock(&code, &DefaultMapping, &.{op});
+    try std.testing.expectEqual(@as(u8, 0xF3), emitted[0]);
+    try std.testing.expectEqual(@as(u8, 0x48), emitted[1]);
+    try std.testing.expectEqual(@as(u8, 0x0F), emitted[2]);
+    try std.testing.expectEqual(@as(u8, 0xBD), emitted[3]);
+    try std.testing.expectEqual(@as(u8, 0xFE), emitted[4]);
+}
+
+test "emit CLZ (LZCNT r32, no REX.W)" {
+    var code: [128]u8 = undefined;
+    // CLZ W0, W1 → LZCNT EDI, ESI = F3 0F BD FE
+    const op = IROp{ .tag = .clz, .dest = 0, .src0 = 1, .src1 = 0x1F, .flags = 2, .imm = 0 };
+    const emitted = emitBlock(&code, &DefaultMapping, &.{op});
+    try std.testing.expectEqual(@as(u8, 0xF3), emitted[0]);
+    try std.testing.expectEqual(@as(u8, 0x0F), emitted[1]);
+    try std.testing.expectEqual(@as(u8, 0xBD), emitted[2]);
+    try std.testing.expectEqual(@as(u8, 0xFE), emitted[3]);
+}
+
+test "emit CRC32 (32-bit data form)" {
+    var code: [128]u8 = undefined;
+    // dest ← CRC32(src0, src1) with 32-bit data → MOV RDI, RSI (48 89 F7) + CRC32 EDI, EDX (F2 0F 38 F1 FA)
+    const op = IROp{ .tag = .crc32, .dest = 0, .src0 = 1, .src1 = 2, .flags = 2, .imm = 0 };
+    const emitted = emitBlock(&code, &DefaultMapping, &.{op});
+    try std.testing.expectEqual(@as(u8, 0x48), emitted[0]); // REX.W
+    try std.testing.expectEqual(@as(u8, 0x89), emitted[1]); // MOV
+    try std.testing.expectEqual(@as(u8, 0xF2), emitted[3]); // F2 prefix
+    try std.testing.expectEqual(@as(u8, 0x0F), emitted[4]);
+    try std.testing.expectEqual(@as(u8, 0x38), emitted[5]);
+    try std.testing.expectEqual(@as(u8, 0xF1), emitted[6]);
+    try std.testing.expectEqual(@as(u8, 0xFA), emitted[7]); // modrm: reg=RDI, rm=RDX
 }

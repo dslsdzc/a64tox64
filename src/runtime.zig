@@ -57,6 +57,9 @@ pub const JitRuntime = struct {
 
     /// Written by emitted code on L1 miss: non-zero means indirect branch.
     indirect_target: u64 = 0,
+    /// Last observed value of Signal.invalidation_generation. When it differs,
+    /// executeInner clears stale L2 entries for the invalidated guest page.
+    l2_sync_generation: u32 = 0,
     guest_sigactions: [MAX_SIGNAL_HANDLERS]SignalAction = undefined,
     l1_cache: [64]L1Entry align(16) = undefined,
     l2_cache: [L2_SIZE]L2Entry align(64) = undefined,
@@ -349,8 +352,28 @@ const tb = try runtime.cache.allocateBlock();
         runtime.executeInner(guest_pc, depth);
     }
 
+    /// Clear L2 cache entries whose guest_pc lies on `guest_page`.
+    /// Called after cache.invalidatePage (SMC path) so stale L2 hits do not
+    /// dispatch to blocks that were removed from the code cache.
+    fn invalidateL2ForGuestPage(runtime: *JitRuntime, guest_page: u64) void {
+        const aligned = guest_page & ~@as(u64, 0xFFF);
+        for (&runtime.l2_cache) |*e| {
+            if (e.guest_pc != 0 and (e.guest_pc & ~@as(u64, 0xFFF)) == aligned) {
+                e.guest_pc = 0;
+            }
+        }
+    }
+
     fn executeInner(runtime: *JitRuntime, guest_pc: u64, depth: u32) void {
         if (depth > 64) return;
+
+        // SMC invalidation sync: signal.zig invalidated guest pages (SMC),
+        // so stale L2 entries pointing at removed blocks must be cleared
+        // before the L2 hit check below.
+        if (runtime.l2_sync_generation != Signal.invalidation_generation) {
+            runtime.l2_sync_generation = Signal.invalidation_generation;
+            runtime.invalidateL2ForGuestPage(Signal.last_invalidated_page);
+        }
 
         // Check for pending signal from signal.zig handler
         if (Signal.pending_signal >= 0) {
@@ -1307,4 +1330,104 @@ test "block entry loads x0-x7 from state" {
     runtime.state.x[2] = 23;
     runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 1023), runtime.state.x[0]);
+}
+
+test "invalidateL2ForGuestPage clears only matching page entries" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    runtime.l2_cache[0] = .{ .guest_pc = 0x1050, .host_addr = 0x1111 };
+    runtime.l2_cache[1] = .{ .guest_pc = 0x1FF0, .host_addr = 0x2222 };
+    runtime.l2_cache[2] = .{ .guest_pc = 0x2000, .host_addr = 0x3333 };
+    runtime.l2_cache[3] = .{ .guest_pc = 0, .host_addr = 0x4444 }; // already empty
+    runtime.invalidateL2ForGuestPage(0x1000);
+    try std.testing.expectEqual(@as(u64, 0), runtime.l2_cache[0].guest_pc);
+    try std.testing.expectEqual(@as(u64, 0), runtime.l2_cache[1].guest_pc);
+    try std.testing.expectEqual(@as(u64, 0x2000), runtime.l2_cache[2].guest_pc);
+    try std.testing.expectEqual(@as(u64, 0), runtime.l2_cache[3].guest_pc);
+}
+
+test "executeInner syncs L2 cache after SMC invalidation" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{ 0xC0, 0x03, 0x5F, 0xD6 }; // RET
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    const pc = runtime.state.pc;
+    runtime.execute(pc, 0); // translate + execute; L2 entry now points at the real block
+
+    // Plant a stale L2 entry (what survives if invalidatePage ran but L2
+    // was not synced: entry guest_pc matches, host_addr points at a dead block)
+    const l2_h = (pc >> 2) & (L2_SIZE - 1);
+    runtime.l2_cache[l2_h] = .{ .guest_pc = pc, .host_addr = 0xDEAD };
+
+    // Simulate the signal.zig SMC path bumping the invalidation generation
+    Signal.invalidation_generation += 1;
+    Signal.last_invalidated_page = pc & ~@as(u64, 0xFFF);
+
+    runtime.execute(pc, 0); // must clear the stale entry and re-resolve the block
+    const l2e = runtime.l2_cache[l2_h];
+    try std.testing.expect(l2e.host_addr != 0xDEAD);
+    try std.testing.expectEqual(pc, l2e.guest_pc);
+}
+
+/// Software CRC-32C (Castagnoli) reference: byte-at-a-time, reflected,
+/// polynomial 0x82F63B78, low byte first, seed = initial accumulator.
+fn refCrc32c(seed: u32, data: u64, bytes: usize) u32 {
+    var crc = seed;
+    var d = data;
+    var i: usize = 0;
+    while (i < bytes) : (i += 1) {
+        crc ^= @as(u32, @truncate(d & 0xFF));
+        var b: usize = 0;
+        while (b < 8) : (b += 1) {
+            crc = (crc >> 1) ^ (0x82F63B78 & (0 -% @as(u32, @intFromBool(crc & 1 != 0))));
+        }
+        d >>= 8;
+    }
+    return crc;
+}
+
+test "CLZ X0, X1 end-to-end" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{ 0x20, 0x10, 0xC0, 0xDA, 0xC0, 0x03, 0x5F, 0xD6 }; // CLZ X0, X1; RET
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.state.x[1] = 0x0000_0000_0001_0000; // 47 leading zeros
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 47), runtime.state.x[0]);
+    runtime.state.x[1] = 0; // zero input → width (64)
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 64), runtime.state.x[0]);
+    runtime.state.x[1] = 0xFFFF_FFFF_FFFF_FFFF;
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 0), runtime.state.x[0]);
+}
+
+test "CRC32CW W0, W1, W2 end-to-end (Castagnoli)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{ 0x20, 0x58, 0xC2, 0x1A, 0xC0, 0x03, 0x5F, 0xD6 }; // CRC32CW W0, W1, W2; RET
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.state.x[1] = 0x12345678; // seed
+    runtime.state.x[2] = 0xDEADBEEF; // data
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(refCrc32c(0x12345678, 0xDEADBEEF, 4), @as(u32, @truncate(runtime.state.x[0])));
+}
+
+test "CRC32CX W0, W1, X2 end-to-end (Castagnoli, 64-bit data)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    const code = [_]u8{ 0x20, 0x5C, 0xC2, 0x9A, 0xC0, 0x03, 0x5F, 0xD6 }; // CRC32CX W0, W1, X2; RET
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.state.x[1] = 0xCAFEBABE12345678; // seed: only low 32 bits used
+    runtime.state.x[2] = 0x8899AABBCCDDEEFF; // 8 data bytes
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(refCrc32c(0x12345678, 0x8899AABBCCDDEEFF, 8), @as(u32, @truncate(runtime.state.x[0])));
 }

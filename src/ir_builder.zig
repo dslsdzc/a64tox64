@@ -125,7 +125,8 @@ pub fn build(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_
         .ror_reg => try buildRor(buf, allocator, inst),
         .clz => try buildClz(buf, allocator, inst),
         .dc_zva => try buildDcZva(buf, allocator, inst),
-        .sys, .crc32 => {}, // SYS/CRC32: no-ops on x86-64 (CRC uses hardware CRC in x86)
+        .sys => {}, // SYS: no-op on x86-64 (system register writes)
+        .crc32 => try buildCrc32(buf, allocator, inst),
         .dmb, .dsb, .isb => {}, // memory barriers: no-op on x86-64
 
         // ── Atomic / exclusive ────────────────────────────────────
@@ -809,10 +810,33 @@ fn buildRor(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
 }
 
 fn buildClz(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
-    // CLZ: count leading zeros.
-    // For MVP: return 0 (sub from XZR). Real impl needs BSR/LZCNT in emitter.
+    // CLZ Xd, Xn → dest = count leading zeros of src0.
+    // Emitted as x86 LZCNT (zero input → width, matching ARM CLZ semantics).
+    // flags carries the data size code: 2 = W (32-bit), 3 = X (64-bit).
     const ops = inst.operands.rrr;
-    try buf.append(allocator, .{ .tag = .sub_i64, .dest = ops.rd, .src0 = 0x1F, .src1 = 0x1F, .flags = 0, .imm = 0 });
+    try buf.append(allocator, .{
+        .tag = .clz, .dest = ops.rd, .src0 = ops.rn,
+        .src1 = 0x1F, .flags = if (inst.sf) @as(u16, 3) else 2, .imm = 0,
+    });
+}
+
+fn buildCrc32(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
+    // CRC32C Wd, Wn, Wm → dest = CRC32(src0 seed, src1 data).
+    // Emitted as x86 CRC32 (MOV dst, src0; CRC32 dst, src1).
+    // flags carries the data size code: 0=8, 1=16, 2=32, 3=64 bits.
+    //
+    // NOTE: empirically verified, the x86 CRC32 instruction computes the
+    // Castagnoli polynomial (0x82F63B78) — i.e. it implements ARM's CRC32C
+    // (bit 12 set), not ARM's plain CRC32 (IEEE 802.3, 0xEDB88320). There is
+    // no x86 instruction for the IEEE variant, so plain CRC32 remains a
+    // documented no-op for now.
+    if ((inst.raw >> 12) & 1 == 0) return; // plain CRC32 (IEEE): not on x86
+    const ops = inst.operands.rrr;
+    const size: u16 = @intCast((inst.raw >> 10) & 3);
+    try buf.append(allocator, .{
+        .tag = .crc32, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm,
+        .flags = size, .imm = 0,
+    });
 }
 
 fn buildDcZva(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
@@ -1065,6 +1089,47 @@ test "ADC SBC decode and emit" {
     // ADC (64-bit)
     const inst_adc64 = Decode.decode(0x9A020020);
     try std.testing.expectEqual(Opcode.adc_reg, inst_adc64.opcode);
+}
+
+test "CLZ produces clz IR" {
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    const inst = Decode.decode(0xDAC01020); // CLZ X0, X1 (llvm-mc verified)
+    try build(&buf, std.testing.allocator, inst, 0);
+    try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);
+    try std.testing.expectEqual(Tag.clz, buf.ops.items[0].tag);
+    try std.testing.expectEqual(@as(u16, 0), buf.ops.items[0].dest);
+    try std.testing.expectEqual(@as(u16, 1), buf.ops.items[0].src0);
+    // 64-bit variant: width code 3 in flags
+    try std.testing.expectEqual(@as(u16, 3), buf.ops.items[0].flags);
+}
+
+test "CRC32C (Castagnoli) produces crc32 IR" {
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    // llvm-mc verified: crc32cw w0, w1, w2 → 0x1AC25820.
+    // The x86 CRC32 instruction implements the Castagnoli polynomial, so the
+    // C variant maps to hardware; the plain (IEEE) variant does not.
+    const inst = Decode.decode(0x1AC25820);
+    try build(&buf, std.testing.allocator, inst, 0);
+    try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);
+    try std.testing.expectEqual(Tag.crc32, buf.ops.items[0].tag);
+    try std.testing.expectEqual(@as(u16, 0), buf.ops.items[0].dest);
+    try std.testing.expectEqual(@as(u16, 1), buf.ops.items[0].src0);
+    try std.testing.expectEqual(@as(u16, 2), buf.ops.items[0].src1);
+    // CRC32CW: size code 2 (32-bit data) in flags
+    try std.testing.expectEqual(@as(u16, 2), buf.ops.items[0].flags);
+}
+
+test "CRC32 (IEEE 802.3) produces no IR" {
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    // crc32w w0, w1, w2 → 0x1AC24820 (llvm-mc verified): the x86 CRC32
+    // instruction computes the Castagnoli polynomial, so the IEEE 802.3
+    // variant has no hardware mapping — remains a documented no-op for now.
+    const inst = Decode.decode(0x1AC24820);
+    try build(&buf, std.testing.allocator, inst, 0);
+    try std.testing.expectEqual(@as(usize, 0), buf.ops.items.len);
 }
 
 // ── NEON SIMD IR builders ─────────────────────────────────────
