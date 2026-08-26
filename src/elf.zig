@@ -923,7 +923,15 @@ test "build and load minimal ELF" {
     defer std.testing.allocator.free(loaded.guest_mem);
 
     try std.testing.expectEqual(@as(u64, 0x10000), loaded.entry);
-    try std.testing.expect(loaded.guest_mem.len >= 0x10000);
+    // guest_mem covers [guest_base, guest_base + guest_size) — the segment
+    // region, not the whole address space (a stale expectation of
+    // len >= 0x10000 predates the page-aligned segment sizing).
+    try std.testing.expectEqual(@as(u64, 0x10000), loaded.guest_base);
+    try std.testing.expect(loaded.guest_size % 4096 == 0); // page-aligned
+    try std.testing.expectEqual(loaded.guest_size, loaded.guest_mem.len);
+    // the entry point must lie inside the loaded region
+    try std.testing.expect(loaded.entry >= loaded.guest_base);
+    try std.testing.expect(loaded.entry - loaded.guest_base < loaded.guest_size);
 }
 
 test "loadElf validates ELF" {

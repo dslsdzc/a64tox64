@@ -270,23 +270,28 @@ fn buildAddSubReg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, t
     });
 }
 
+/// Emit the shifted-register operand (LSL/LSR/ASR by imm6 at bits 15-10)
+/// when the shift amount is nonzero; returns the src register for the
+/// consuming op (X16 temp when a shift was emitted, Rm otherwise).
+fn appendShiftedOperand(buf: *IRBuffer, allocator: std.mem.Allocator, ops: anytype) !u16 {
+    if (ops.amount == 0) return ops.rm;
+    const shift_tag: Tag = switch (ops.shift) {
+        .lsl => .lshl_i64_imm,
+        .lsr => .lshr_i64_imm,
+        .asr => .ashr_i64_imm,
+        .ror => .lshr_i64_imm, // ROR not used by logical shifted-register ops; treat as LSR
+    };
+    try buf.append(allocator, .{
+        .tag = shift_tag, .dest = 16, .src0 = ops.rm, .src1 = 0x1F,
+        .flags = 0, .imm = ops.amount,
+    });
+    return 16;
+}
+
 fn buildLogical(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
     const ops = inst.operands.rrr_shift;
     // Emit the shift before the logical op when shift amount > 0
-    var src1 = ops.rm;
-    if (ops.amount > 0) {
-        const shift_tag: Tag = switch (ops.shift) {
-            .lsl => .lshl_i64_imm,
-            .lsr => .lshr_i64_imm,
-            .asr => .ashr_i64_imm,
-            .ror => .lshr_i64_imm, // ROR not used by logical shifted-register ops; treat as LSR
-        };
-        try buf.append(allocator, .{
-            .tag = shift_tag, .dest = 16, .src0 = ops.rm, .src1 = 0x1F,
-            .flags = 0, .imm = ops.amount,
-        });
-        src1 = 16;
-    }
+    const src1 = try appendShiftedOperand(buf, allocator, ops);
     try buf.append(allocator, .{
         .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = src1,
         .flags = 0, .imm = 0,
@@ -297,22 +302,25 @@ fn buildLogical(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag
 
 fn buildBic(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.rrr_shift;
-    // BIC Xd, Xn, Xm = Xd = Xn & ~Xm
+    // BIC Xd, Xn, Xm = Xd = Xn & ~Xm (with optional shift of Xm)
     // Use x16 (IP0) as temp for ~Xm
-    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
+    const src1 = try appendShiftedOperand(buf, allocator, ops);
+    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = src1, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .and_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
 }
 
 fn buildOrn(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.rrr_shift;
-    // ORN Xd, Xn, Xm = Xd = Xn | ~Xm
-    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
+    // ORN Xd, Xn, Xm = Xd = Xn | ~Xm (with optional shift of Xm)
+    const src1 = try appendShiftedOperand(buf, allocator, ops);
+    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = src1, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .or_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
 }
 
 fn buildEon(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     const ops = inst.operands.rrr_shift;
-    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
+    const src1 = try appendShiftedOperand(buf, allocator, ops);
+    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = src1, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .xor_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
 }
 
@@ -329,14 +337,16 @@ fn buildLogicalFlags(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst
     // preserves C and V (unlike x86 which clears CF). For the MVP, this is close enough —
     // N and Z match. C and V may differ in edge cases.
     const ops = inst.operands.rrr_shift;
-    try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm, .flags = 0, .imm = 0 });
+    const src1 = try appendShiftedOperand(buf, allocator, ops);
+    try buf.append(allocator, .{ .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = src1, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
 }
 
 fn buildBics(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void {
     // BICS Xd, Xn, Xm = Xd = Xn & ~Xm (with NZCV update)
     const ops = inst.operands.rrr_shift;
-    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = ops.rm, .src1 = 0, .flags = 0, .imm = 0 });
+    const src1 = try appendShiftedOperand(buf, allocator, ops);
+    try buf.append(allocator, .{ .tag = .not_, .dest = 16, .src0 = src1, .src1 = 0, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .and_, .dest = ops.rd, .src0 = ops.rn, .src1 = 16, .flags = 0, .imm = 0 });
     try buf.append(allocator, .{ .tag = .nzcv_update, .dest = 0, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
 }
@@ -422,8 +432,18 @@ fn buildExtr(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
     // EXTR Xd, Xn, Xm, #s = (Xn >> s) | (Xm << (size-s))
     // Decompose into: lsr + lsl + or
     const ops = inst.operands.rrr;
-    const s: u32 = (inst.raw >> 16) & 0x3F; // immr = bits 21-16
+    // The shift amount (lsb) is imms at bits 15-10. Bits 20-16 are Rm, NOT
+    // the shift (previously read `(raw >> 16) & 0x3F`, which grabbed Rm's
+    // top bit and shifted by the wrong amount whenever Rm >= 16 or, worse,
+    // when Rm's bit-4 combined with the actual field).
+    const s: u32 = (inst.raw >> 10) & 0x3F;
     const size: u64 = if (inst.sf) 64 else 32;
+    // EXTR #0 degenerates to MOV Rd, Rn (Xm << 64 would wrap to Xm << 0 on
+    // x86). Guard it so the result is Xn, not Xn | Xm.
+    if (s == 0) {
+        try buf.append(allocator, .{ .tag = .mov_i64, .dest = ops.rd, .src0 = ops.rn, .src1 = 0, .flags = 0, .imm = 0 });
+        return;
+    }
     const left: u32 = @truncate(size - s);
     // lsr X16, Xn, s
     try buf.append(allocator, .{ .tag = .lshr_i64_imm, .dest = 16, .src0 = ops.rn, .src1 = 0x1F, .flags = 0, .imm = s });
@@ -1035,12 +1055,48 @@ test "BIC → IR (decomposed)" {
     var buf: IRBuffer = .{};
     defer buf.deinit(std.testing.allocator);
     // BIC X0, X1, X2 → NOT X2 + AND X1, ~X2
-    const inst = Decode.decode(0x8A620020); // BIC X0, X1, X2
+    // 0x8A620020 = "BIC X0, X1, X2, LSR #0" (llvm-mc-verified); LSR #0 is the
+    // identity shift, so the decomposed form is exactly NOT + AND. This also
+    // regression-tests the shifted-logical decode path (bits 23-22 = shift
+    // type, bit 21 = N), which previously decoded as .unknown.
+    const inst = Decode.decode(0x8A620020);
     try build(&buf, std.testing.allocator, inst, 0);
     try std.testing.expectEqual(@as(usize, 2), buf.ops.items.len);
     try std.testing.expectEqual(Tag.not_, buf.ops.items[0].tag);
     try std.testing.expectEqual(@as(u16, 2), buf.ops.items[0].src0); // ~X2
     try std.testing.expectEqual(Tag.and_, buf.ops.items[1].tag);
+}
+
+test "BIC with nonzero LSR shift → IR (3 ops)" {
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    // BIC X0, X1, X2, LSR #3 = 0x8A620C20 (llvm-mc-verified)
+    // → LSR X16, X2, #3 + NOT X16 + AND X0, X1, X16
+    const inst = Decode.decode(0x8A620C20);
+    try build(&buf, std.testing.allocator, inst, 0);
+    try std.testing.expectEqual(@as(usize, 3), buf.ops.items.len);
+    try std.testing.expectEqual(Tag.lshr_i64_imm, buf.ops.items[0].tag);
+    try std.testing.expectEqual(@as(u32, 3), buf.ops.items[0].imm);
+    try std.testing.expectEqual(Tag.not_, buf.ops.items[1].tag);
+    try std.testing.expectEqual(Tag.and_, buf.ops.items[2].tag);
+}
+
+test "EXTR → IR (lsb from bits 15-10)" {
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    // EXTR X0, X1, X2, #7 = 0x93C21C20 (llvm-mc-verified).
+    // The lsb lives at bits 15-10 (imms); bits 20-16 are Rm (=2 here), a
+    // field the previous buildExtr misread as the shift amount.
+    // → LSR X16, X1, #7 + LSL X17, X2, #57 + OR X0, X16, X17
+    const inst = Decode.decode(0x93C21C20);
+    try build(&buf, std.testing.allocator, inst, 0);
+    try std.testing.expectEqual(@as(usize, 3), buf.ops.items.len);
+    try std.testing.expectEqual(Tag.lshr_i64_imm, buf.ops.items[0].tag);
+    try std.testing.expectEqual(@as(u32, 7), buf.ops.items[0].imm); // lsb = 7, not Rm-derived 2
+    try std.testing.expectEqual(@as(u16, 1), buf.ops.items[0].src0); // Xn = X1
+    try std.testing.expectEqual(Tag.lshl_i64_imm, buf.ops.items[1].tag);
+    try std.testing.expectEqual(@as(u32, 57), buf.ops.items[1].imm); // 64 - 7
+    try std.testing.expectEqual(Tag.or_, buf.ops.items[2].tag);
 }
 
 test "UBFM (UXTB) → IR" {

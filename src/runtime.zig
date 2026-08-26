@@ -1287,19 +1287,26 @@ test "SUB + MOVZ pipeline" {
 }
 
 test "SVC register capture: x0 and x8 preserved" {
+    // NOTE: this test previously executed ARM64 __NR_exit (93), which
+    // genuinely killed the test process (exit is handled by the kernel, not
+    // the translator — the translation itself was verified correct via gdb
+    // in Task 6, so the test, not the engine, was broken).
+    // Rewritten to use sched_yield (ARM64 nr 124, host nr 24), which
+    // returns 0: the invariant under test is "handleSyscall writes the
+    // syscall result into x0 and preserves x8 through dispatch".
     var runtime = JitRuntime.init(std.testing.allocator);
     defer runtime.deinit();
     const code = [_]u8{
-        0x40, 0x05, 0x80, 0xD2,  // MOVZ X0, #42
-        0xA8, 0x0B, 0x80, 0xD2,  // MOVZ X8, #93 (__NR_exit)
+        0x40, 0x05, 0x80, 0xD2,  // MOVZ X0, #42 (clobbered by syscall result)
+        0x88, 0x0F, 0x80, 0xD2,  // MOVZ X8, #124 (__NR_sched_yield)
         0x01, 0x00, 0x00, 0xD4,  // SVC #0
     };
     const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
     defer std.testing.allocator.free(elf);
     try runtime.loadElf(elf);
     runtime.execute(runtime.state.pc, 0);
-    try std.testing.expectEqual(@as(u64, 42), runtime.state.x[0]);
-    try std.testing.expectEqual(@as(u64, 93), runtime.state.x[8]);
+    try std.testing.expectEqual(@as(u64, 0), runtime.state.x[0]); // sched_yield returns 0
+    try std.testing.expectEqual(@as(u64, 124), runtime.state.x[8]); // preserved through SVC
 }
 
 test "SVC getpid returns positive PID" {

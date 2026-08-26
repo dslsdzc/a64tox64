@@ -278,10 +278,11 @@ fn decodeOpcode(raw: u32) Opcode {
     if ((raw & 0xFFE00000) == 0x9B400000 and (raw & 0x0000FC00) == 0x00007C00) return .smulh;
     if ((raw & 0xFFE00000) == 0x9BC00000 and (raw & 0x0000FC00) == 0x00007C00) return .umulh;
 
-    // EXTR (extract register): bits 30-24 = 00|10011, bit 23 = 1, bit 22 = N (0 for 32-bit)
-    // Bit 23 = 1 distinguishes EXTR from SBFM (bits 28-23 = 100111 vs 100110)
-    if ((raw & 0xFFE00000) == 0x13800000) return .extr;  // EXTR 32-bit (N=0)
-    if ((raw & 0xFFE00000) == 0x93C00000) return .extr;  // EXTR 64-bit (N=1)
+    // EXTR (extract register): bits 30-24 = 00|10011, bit 23 = 1, bits 22-21 = 00.
+    // 32-bit vs 64-bit is distinguished by sf (bit 31) alone. Note the shift
+    // amount (lsb) lives at bits 15-10 (imms); bits 20-16 are Rm.
+    if ((raw & 0xFFE00000) == 0x13800000) return .extr;  // EXTR 32-bit
+    if ((raw & 0xFFE00000) == 0x93C00000) return .extr;  // EXTR 64-bit
 
     // ── Advanced SIMD (NEON) — encoding-class masks (corpus-verified) ──
     // Load/store structures: prefix 0x0C/0x0D (Q at bit 30, masked out) covers
@@ -382,23 +383,22 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0x7FE00000, .value = 0x8B200000, .opcode = .add_ext },  // ADD (extend, 64-bit)
     .{ .mask = 0x7FE00000, .value = 0x4B200000, .opcode = .sub_ext },  // SUB (extend, 32-bit)
     .{ .mask = 0x7FE00000, .value = 0xCB200000, .opcode = .sub_ext },  // SUB (extend, 64-bit)
-    // Logical (register)
-    .{ .mask = 0x7FE00000, .value = 0x0A000000, .opcode = .and_reg },  // AND (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0x8A000000, .opcode = .and_reg },  // AND (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x6A000000, .opcode = .ands_reg }, // ANDS (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xEA000000, .opcode = .ands_reg }, // ANDS (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x0A200000, .opcode = .bic_reg },  // BIC (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0x8A200000, .opcode = .bic_reg },  // BIC (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x6A200000, .opcode = .bics_reg }, // BICS (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xEA200000, .opcode = .bics_reg }, // BICS (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x2A000000, .opcode = .orr_reg },  // ORR (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xAA000000, .opcode = .orr_reg },  // ORR (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x2A200000, .opcode = .orn_reg },  // ORN (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xAA200000, .opcode = .orn_reg },  // ORN (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x4A000000, .opcode = .eor_reg },  // EOR (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xCA000000, .opcode = .eor_reg },  // EOR (64-bit)
-    .{ .mask = 0x7FE00000, .value = 0x4A200000, .opcode = .eon_reg },  // EON (32-bit)
-    .{ .mask = 0x7FE00000, .value = 0xCA200000, .opcode = .eon_reg },  // EON (64-bit)
+    // Logical (register).
+    // AArch64 logical shifted-register layout: opc at 30-29, S at 28,
+    // class 1010 at 27-24, shift type at 23-22 (00=LSL,01=LSR,10=ASR),
+    // N (NOT the shifted operand, i.e. BIC/ORN/EON) at 21, Rm at 20-16,
+    // imm6 at 15-10. Mask 0x7FA00000 keeps 30-24 + bit 21 but ignores the
+    // shift-type bits, so LSL/LSR/ASR forms all classify (previously only
+    // shift=LSL matched, so e.g. "BIC X0,X1,X2,LSR #0" = 0x8A620020 decoded
+    // as .unknown). sf (bit 31) is excluded, so one row covers both widths.
+    .{ .mask = 0x7FA00000, .value = 0x0A000000, .opcode = .and_reg },  // AND (and ANDS-checked below; S=0)
+    .{ .mask = 0x7FA00000, .value = 0x6A000000, .opcode = .ands_reg }, // ANDS (S=1)
+    .{ .mask = 0x7FA00000, .value = 0x0A200000, .opcode = .bic_reg },  // BIC (N=1)
+    .{ .mask = 0x7FA00000, .value = 0x6A200000, .opcode = .bics_reg }, // BICS (S=1, N=1)
+    .{ .mask = 0x7FA00000, .value = 0x2A000000, .opcode = .orr_reg },  // ORR
+    .{ .mask = 0x7FA00000, .value = 0x2A200000, .opcode = .orn_reg },  // ORN (N=1)
+    .{ .mask = 0x7FA00000, .value = 0x4A000000, .opcode = .eor_reg },  // EOR
+    .{ .mask = 0x7FA00000, .value = 0x4A200000, .opcode = .eon_reg },  // EON (N=1)
     // MUL/MNEG (bits 15-10 = Ra field, 11111x = Ra=31)
     // Note: mask includes bit 31 (sf) to distinguish 32/64-bit
     .{ .mask = 0xFFE0FE00, .value = 0x0B007C00, .opcode = .mul },      // MUL (32-bit, Ra=31, ov=0)
