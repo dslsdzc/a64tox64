@@ -74,6 +74,23 @@ pub fn registerBlock(host_addr: []u8, guest_pc: u64) void {
     }
 }
 
+const MAX_GUEST_SIGNALS = 64;
+var guest_handler_flags: [MAX_GUEST_SIGNALS]u8 = blk: {
+    var arr: [MAX_GUEST_SIGNALS]u8 = undefined;
+    @memset(&arr, 0);
+    break :blk arr;
+};
+
+/// Mark whether a guest signal handler is registered for `sig`.
+/// Called by the runtime when guest rt_sigaction is intercepted.
+pub fn setGuestHandler(sig: usize, registered: bool) void {
+    if (sig < MAX_GUEST_SIGNALS) guest_handler_flags[sig] = @intFromBool(registered);
+}
+
+fn guestHandlerRegistered(sig: usize) bool {
+    return sig < MAX_GUEST_SIGNALS and guest_handler_flags[sig] != 0;
+}
+
 /// Mark a guest page as having modified code — invalidate all blocks.
 /// Called from the SEGV handler when guest code writes to a page with
 /// cached translations. Returns the number of blocks invalidated.
@@ -102,22 +119,16 @@ fn invalidateGuestPage(guest_page: u64) usize {
     return count;
 }
 
-/// O(log n) block lookup via binary search on sorted start addresses.
+/// Block lookup for crash-time diagnostics.
+/// Linear scan: block_ranges is NOT sorted by host address (blocks come from
+/// multiple code-cache mmaps and can be registered out of order), so binary
+/// search would miss entries. Max 4096 entries, crash handler is a rare path.
 fn findBlock(rip: u64) ?u64 {
-    // Binary search on start addresses
-    var lo: usize = 0;
-    var hi: usize = if (block_count > 0) block_count - 1 else 0;
-    while (lo <= hi and block_count > 0) {
-        const mid = (lo + hi) / 2;
-        const entry = block_ranges[mid];
-        if (rip < entry.start) {
-            if (mid == 0) break;
-            hi = mid - 1;
-        } else if (rip >= entry.end) {
-            lo = mid + 1;
-        } else {
-            return entry.guest_pc;
-        }
+    var i: usize = 0;
+    while (i < block_count) {
+        const entry = block_ranges[i];
+        if (rip >= entry.start and rip < entry.end) return entry.guest_pc;
+        i += 1;
     }
     return null;
 }
@@ -160,19 +171,8 @@ fn handler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) c
     const info_addr = @intFromPtr(info);
     const fault_addr = @as(*usize, @alignCast(@ptrCast(@as(*anyopaque, @ptrFromInt(info_addr + 16))))).*;
 
-    // Signal forwarding: set pending_signal flag for runtime to dispatch.
-    // The execute() loop checks this before the next block execution.
-    if (sig_int >= 0 and @as(usize, @intCast(sig_int)) < 64) {
-        pending_signal = @as(i32, @intCast(sig_int));
-        pending_fault_addr = fault_addr;
-        // Find guest PC from RIP → findBlock
-        _ = findBlock(rip);
-        putStr("→ Signal pending — will dispatch to guest handler\n");
-        return; // Return without killing — execute() checks pending_signal
-    }
-
-    // SMC detection: guest code wrote to guest memory with cached translations.
-    // Allow the write, invalidate affected blocks — next execution re-translates.
+    // 1. SMC detection first: SIGSEGV writing to a guest page that has
+    //    cached translations → allow the write, invalidate, continue.
     if (sig == linux.SIG.SEGV) {
         const smc_page = guestPageWithTranslations(fault_addr);
         if (smc_page != 0) {
@@ -181,9 +181,6 @@ fn handler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) c
             putStr(" modified — invalidating translations\n");
             const n = invalidateGuestPage(smc_page);
             putHex(n); putStr(" blocks invalidated\n");
-
-            // Also remove this page from tracking (write already occurred,
-            // so future writes don't need to re-invalidate)
             var pi: usize = 0;
             while (pi < guest_page_count) {
                 if (guest_pages[pi] == smc_page) {
@@ -197,51 +194,59 @@ fn handler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) c
                     pi += 1;
                 }
             }
-            return; // Write completed, continue execution
+            return;
         }
     }
 
-    // Crash diagnostics
-    const sig_name = switch (sig) {
-        linux.SIG.SEGV => "SIGSEGV",
-        linux.SIG.ILL => "SIGILL",
-        linux.SIG.FPE => "SIGFPE",
-        linux.SIG.BUS => "SIGBUS",
-        else => "SIGNAL",
-    };
-    putStr("\n=== "); putStr(sig_name); putStr(" ===\n");
-    putStr("Fault addr: "); putHex(fault_addr); putStr("\n");
-    putStr("Host RIP:   "); putHex(rip); putStr("\n");
-
-    if (findBlock(rip)) |pc| {
-        putStr("Guest PC:   "); putHex(pc); putStr(" (in JIT block)\n");
-    } else {
-        putStr("(not in JIT code)\n");
-        // Not in JIT code — re-raise with default handler for core dump
-        var dfl: linux.Sigaction = .{
-            .handler = .{ .handler = null },
-            .mask = @as(linux.sigset_t, undefined),
-            .flags = 0,
+    // 2. Crash diagnostics for faults inside JIT blocks.
+    const in_jit = findBlock(rip) != null;
+    if (in_jit) {
+        const sig_name = switch (sig) {
+            linux.SIG.SEGV => "SIGSEGV",
+            linux.SIG.ILL => "SIGILL",
+            linux.SIG.FPE => "SIGFPE",
+            linux.SIG.BUS => "SIGBUS",
+            else => "SIGNAL",
         };
-        _ = linux.sigaction(sig, &dfl, null);
-        _ = linux.syscall2(.kill, @as(u64, @bitCast(@as(i64, linux.getpid()))), @as(usize, sig_int));
-        return; // unreachable
+        putStr("\n=== "); putStr(sig_name); putStr(" ===\n");
+        putStr("Fault addr: "); putHex(fault_addr); putStr("\n");
+        putStr("Host RIP:   "); putHex(rip); putStr("\n");
+        // findBlock(rip) is non-null here (in_jit); print the guest PC
+        if (findBlock(rip)) |pc| {
+            putStr("Guest PC:   "); putHex(pc); putStr("\n");
+        }
+        putStr("\nRAX="); putHex(gregs[13]); putStr(" RBX="); putHex(gregs[11]);
+        putStr(" RCX="); putHex(gregs[14]); putStr(" RDX="); putHex(gregs[12]);
+        putStr("\nRDI="); putHex(gregs[8]);  putStr(" RSI="); putHex(gregs[9]);
+        putStr(" RBP="); putHex(gregs[10]); putStr(" RSP="); putHex(gregs[15]);
+        putStr("\nR8 ="); putHex(gregs[0]);  putStr(" R9 ="); putHex(gregs[1]);
+        putStr(" R10="); putHex(gregs[2]);  putStr(" R11="); putHex(gregs[3]);
+        putStr("\nR12="); putHex(gregs[4]);  putStr(" R13="); putHex(gregs[5]);
+        putStr(" R14="); putHex(gregs[6]);  putStr(" R15="); putHex(gregs[7]);
+        putStr("\n\n");
     }
 
-    putStr("\nRAX="); putHex(gregs[13]); putStr(" RBX="); putHex(gregs[11]);
-    putStr(" RCX="); putHex(gregs[14]); putStr(" RDX="); putHex(gregs[12]);
-    putStr("\nRDI="); putHex(gregs[8]);  putStr(" RSI="); putHex(gregs[9]);
-    putStr(" RBP="); putHex(gregs[10]); putStr(" RSP="); putHex(gregs[15]);
-    putStr("\nR8 ="); putHex(gregs[0]);  putStr(" R9 ="); putHex(gregs[1]);
-    putStr(" R10="); putHex(gregs[2]);  putStr(" R11="); putHex(gregs[3]);
-    putStr("\nR12="); putHex(gregs[4]);  putStr(" R13="); putHex(gregs[5]);
-    putStr(" R14="); putHex(gregs[6]);  putStr(" R15="); putHex(gregs[7]);
-    putStr("\n\n");
+    // 3. Forward to guest handler — only when a guest handler is registered.
+    //    (guest_sigactions is populated by rt_sigaction interception, which
+    //    is not implemented yet, so this branch is currently never taken.)
+    if (sig_int >= 0 and @as(usize, @intCast(sig_int)) < MAX_GUEST_SIGNALS) {
+        if (guestHandlerRegistered(@as(usize, @intCast(sig_int)))) {
+            pending_signal = @as(i32, @intCast(sig_int));
+            pending_fault_addr = fault_addr;
+            putStr("→ Signal pending — will dispatch to guest handler\n");
+            return;
+        }
+    }
 
-    // JIT crash: return without killing. The translated block will be
-    // re-executed from the top on next dispatch. For crashes in JIT code,
-    // the error is reported and execution continues (may re-crash).
-    putStr("JIT crash — continuing (may re-crash at same location)\n");
+    // 4. Otherwise: restore default handler and re-raise (core dump).
+    var dfl: linux.Sigaction = .{
+        .handler = .{ .handler = null },
+        .mask = @as(linux.sigset_t, undefined),
+        .flags = 0,
+    };
+    _ = linux.sigaction(sig, &dfl, null);
+    _ = linux.syscall2(.kill, @as(u64, @bitCast(@as(i64, linux.getpid()))), @as(usize, sig_int));
+    return; // unreachable
 }
 
 /// Set guest memory bounds for SMC detection.
