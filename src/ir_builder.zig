@@ -970,7 +970,7 @@ fn buildMRSMSR(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !voi
 test "ADD immediate → IR" {
     var buf: IRBuffer = .{};
     defer buf.deinit(std.testing.allocator);
-    const inst = Decode.decode(0x91000C2A); // ADD X0, X1, #42
+    const inst = Decode.decode(0x9100A820); // ADD X0, X1, #42
     try build(&buf, std.testing.allocator, inst, 0x1000);
     try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);
     try std.testing.expectEqual(Tag.add_i64, buf.ops.items[0].tag);
@@ -1563,7 +1563,7 @@ test "DC ZVA X0 → 8 store_u64 ops" {
 test "MRS CTR_EL0 returns constant 0x8000C24" {
     var buf: IRBuffer = .{};
     defer buf.deinit(std.testing.allocator);
-    const inst = Decode.decode(0xD51B0020); // MRS X0, CTR_EL0
+    const inst = Decode.decode(0xD53B0020); // MRS X0, CTR_EL0
     try build(&buf, std.testing.allocator, inst, 0);
     // Should emit one add_i64 op with the constant
     try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);

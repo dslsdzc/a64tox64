@@ -263,9 +263,10 @@ fn decodeOpcode(raw: u32) Opcode {
     // Exception generation (SVC)
     if ((raw & 0xFF000000) == 0xD4000000) return .svc;
 
-    // NOP/HINT (all hint encodings: HINT #0-N)
-    if ((raw & 0xFFFFF000) == 0xD5032000) return .hint;
+    // NOP (must be checked before generic HINT)
     if (raw == 0xD503201F) return .nop;
+    // HINT (all hint encodings: HINT #0-N)
+    if ((raw & 0xFFFFF000) == 0xD5032000) return .hint;
 
     // TBZ/TBNZ
     if ((raw & 0x7E000000) == 0x36000000) return .tbz;
@@ -422,7 +423,7 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0xFFFFFFE0, .value = 0xD5037420, .opcode = .dc_zva },
 
     // ── MRS/MSR (system register access) ──────────────────────────
-    .{ .mask = 0xFFE00000, .value = 0xD5100000, .opcode = .mrs },      // MRS (bits 31-20 = 110101010001)
+    .{ .mask = 0xFFF00000, .value = 0xD5300000, .opcode = .mrs },      // MRS (bits 31-20 = 110101010011)
     .{ .mask = 0xFFE00000, .value = 0xD5000000, .opcode = .msr },      // MSR (bits 31-20 = 110101010000)
 
     // ── Shift by register ──────────────────────────────────────
@@ -820,8 +821,8 @@ fn extractNeon(raw: u32, _: Opcode) Operands {
 // ── Tests ─────────────────────────────────────────────────────────
 
 test "decode ADD immediate (32-bit)" {
-    // ADD W0, W1, #42 → 0x11000C2A
-    const inst = decode(0x11000C2A);
+    // ADD W0, W1, #42 → 0x1100A820
+    const inst = decode(0x1100A820);
     try std.testing.expectEqual(Opcode.add_imm, inst.opcode);
     try std.testing.expectEqual(false, inst.sf);
     try std.testing.expectEqual(@as(u5, 0), inst.operands.rri12.rd);
@@ -830,8 +831,8 @@ test "decode ADD immediate (32-bit)" {
 }
 
 test "decode ADD immediate (64-bit)" {
-    // ADD X0, X1, #42 → 0x91000C2A
-    const inst = decode(0x91000C2A);
+    // ADD X0, X1, #42 → 0x9100A820
+    const inst = decode(0x9100A820);
     try std.testing.expectEqual(Opcode.add_imm, inst.opcode);
     try std.testing.expectEqual(true, inst.sf);
     try std.testing.expectEqual(@as(u5, 0), inst.operands.rri12.rd);
@@ -840,8 +841,8 @@ test "decode ADD immediate (64-bit)" {
 }
 
 test "decode SUB immediate" {
-    // SUB X2, X3, #0xFF → 0xD1007C62
-    const inst = decode(0xD1007C62);
+    // SUB X2, X3, #0xFF → 0xD103FC62
+    const inst = decode(0xD103FC62);
     try std.testing.expectEqual(Opcode.sub_imm, inst.opcode);
     try std.testing.expectEqual(@as(u5, 2), inst.operands.rri12.rd);
     try std.testing.expectEqual(@as(u5, 3), inst.operands.rri12.rn);
@@ -849,9 +850,9 @@ test "decode SUB immediate" {
 }
 
 test "decode MOVZ (64-bit)" {
-    // MOVZ X0, #0x42 → 0xD2800080
+    // MOVZ X0, #0x42 → 0xD2800840
     // Encoding: sf=1, opc=10, hw=00, imm16=0x0042, rd=0
-    const inst = decode(0xD2800080);
+    const inst = decode(0xD2800840);
     try std.testing.expectEqual(Opcode.movz, inst.opcode);
     try std.testing.expectEqual(@as(u5, 0), inst.operands.ri16_hw.rd);
     try std.testing.expectEqual(@as(u16, 0x0042), inst.operands.ri16_hw.imm16);
@@ -906,8 +907,8 @@ test "decode CSEL X0, X1, X2, EQ" {
 }
 
 test "decode MUL X0, X1, X2" {
-    // MUL X0, X1, X2 → 0x9B007C20
-    const inst = decode(0x9B007C20);
+    // MUL X0, X1, X2 → 0x9B027C20
+    const inst = decode(0x9B027C20);
     try std.testing.expectEqual(Opcode.mul, inst.opcode);
     try std.testing.expectEqual(@as(u5, 0), inst.operands.rrr.rd);
     try std.testing.expectEqual(@as(u5, 1), inst.operands.rrr.rn);
@@ -1005,7 +1006,7 @@ test "decode DC ZVA X31 (XZR)" {
 }
 
 test "MRS CTR_EL0 decode" {
-    // MRS X0, CTR_EL0 = 0xD51B0020
-    const inst = decode(0xD51B0020);
+    // MRS X0, CTR_EL0 = 0xD53B0020
+    const inst = decode(0xD53B0020);
     try std.testing.expectEqual(Opcode.mrs, inst.opcode);
 }
