@@ -231,10 +231,18 @@ fn buildMovk(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst) !void 
 
 fn buildAdr(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_pc: u64) !void {
     const ops = inst.operands.rl;
-    var target = @as(u64, @bitCast(@as(i64, @intCast(guest_pc)) + ops.label));
-    // ADRP returns the page-aligned address (lower 12 bits cleared).
+    var target: u64 = undefined;
     if (inst.opcode == .adrp) {
-        target &= ~@as(u64, 0xFFF);
+        // ADRP: the imm21 field is a PAGE offset (units of 4KB), relative to
+        // the page of the PC. Previously the unshifted imm21 was added to the
+        // full PC and the result page-masked, which dropped the page offset
+        // entirely (e.g. "adrp x7, 0x5b5000" at 0x405944 produced 0x405000
+        // instead of 0x5b5000).
+        const label = @as(i64, ops.label) << 12;
+        target = (guest_pc & ~@as(u64, 0xFFF)) +% @as(u64, @bitCast(label));
+    } else {
+        // ADR: imm21 is a byte offset from the PC.
+        target = @as(u64, @bitCast(@as(i64, @intCast(guest_pc)) + ops.label));
     }
     try buf.append(allocator, .{
         .tag = .add_i64, .dest = ops.rd, .src0 = 0x1F, .src1 = 0x1F,
@@ -249,25 +257,41 @@ fn buildAdr(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, guest_p
 fn buildAddSubReg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag) !void {
     // add_reg → rrr operands (rd, rn, rm)
     // add_ext → mem_reg operands (rt, rn, rm, extend, amount)
-    const rd: u16 = switch (inst.operands) {
-        .rrr => |ops| ops.rd,
-        .mem_reg => |ops| ops.rt,
+    switch (inst.operands) {
+        .rrr => |ops| {
+            try buf.append(allocator, .{
+                .tag = tag, .dest = ops.rd, .src0 = ops.rn, .src1 = ops.rm,
+                .flags = 0, .imm = 0,
+            });
+        },
+        .mem_reg => |ops| {
+            // ADD/SUB (extended register): Xd = Xn + extend(Xm) << amount
+            // Materialize the extended+shifted operand in X16.
+            var src1: u16 = ops.rm;
+            if (ops.extend != .uxtx and ops.extend != .sxtx) {
+                // Zero/sign-extend the low 8/16/32 bits of Xm.
+                const bits: u6 = switch (ops.extend) {
+                    .uxtb, .sxtb => 8,
+                    .uxth, .sxth => 16,
+                    .uxtw, .sxtw => 32,
+                    else => unreachable,
+                };
+                const left: u32 = 64 - @as(u32, bits);
+                try buf.append(allocator, .{ .tag = .lshl_i64_imm, .dest = 16, .src0 = ops.rm, .src1 = 0x1F, .flags = 0, .imm = left });
+                try buf.append(allocator, .{ .tag = if (ops.extend == .uxtb or ops.extend == .uxth or ops.extend == .uxtw) .lshr_i64_imm else .ashr_i64_imm, .dest = 16, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = left });
+                src1 = 16;
+            }
+            if (ops.amount > 0) {
+                try buf.append(allocator, .{ .tag = .lshl_i64_imm, .dest = 16, .src0 = src1, .src1 = 0x1F, .flags = 0, .imm = ops.amount });
+                src1 = 16;
+            }
+            try buf.append(allocator, .{
+                .tag = tag, .dest = ops.rt, .src0 = ops.rn, .src1 = src1,
+                .flags = 0, .imm = 0,
+            });
+        },
         else => return, // unknown operand type, skip
-    };
-    const rn: u16 = switch (inst.operands) {
-        .rrr => |ops| ops.rn,
-        .mem_reg => |ops| ops.rn,
-        else => return,
-    };
-    const rm: u16 = switch (inst.operands) {
-        .rrr => |ops| ops.rm,
-        .mem_reg => |ops| ops.rm,
-        else => return,
-    };
-    try buf.append(allocator, .{
-        .tag = tag, .dest = rd, .src0 = rn, .src1 = rm,
-        .flags = 0, .imm = 0,
-    });
+    }
 }
 
 /// Emit the shifted-register operand (LSL/LSR/ASR by imm6 at bits 15-10)
@@ -619,22 +643,53 @@ fn spBase(buf: *IRBuffer, allocator: std.mem.Allocator, rn: u16) !u16 {
     return spGet(buf, allocator);
 }
 
+/// Emit the writeback for a post/pre-index LDR/STR: Rn += offset
+/// (SP handled via sp_get/sp_put since SP lives in R15).
+fn emitMemWriteback(buf: *IRBuffer, allocator: std.mem.Allocator, rn: u16, offset: i64) !void {
+    const off_u = @as(u64, @bitCast(offset));
+    if (rn == 31) {
+        try buf.append(allocator, .{ .tag = .sp_get, .dest = 16, .src0 = 0, .src1 = 0, .flags = 0, .imm = 0 });
+        try buf.append(allocator, .{ .tag = .add_i64, .dest = 16, .src0 = 16, .src1 = 0x1F, .flags = 0, .imm = @truncate(off_u) });
+        try buf.append(allocator, .{ .tag = .sp_put, .dest = 16, .src0 = 16, .src1 = 0, .flags = 0, .imm = 0 });
+    } else {
+        try buf.append(allocator, .{ .tag = .add_i64, .dest = rn, .src0 = rn, .src1 = 0x1F, .flags = 0, .imm = @truncate(off_u) });
+    }
+}
+
 fn buildLoad(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag, _: bool) !void {
     const ops = inst.operands.mem_imm;
+    const is_pre_index = ops.writeback and !ops.post_index;
+    if (is_pre_index) {
+        // Pre-index: Rn += offset, then load from [Rn + 0]
+        try emitMemWriteback(buf, allocator, ops.rn, ops.offset);
+    }
     const base = try spBase(buf, allocator, ops.rn);
+    const load_offset: i64 = if (ops.writeback) 0 else ops.offset;
     try buf.append(allocator, .{
         .tag = tag, .dest = ops.rt, .src0 = base, .src1 = 0,
-        .flags = 0, .imm = @as(u32, @truncate(@as(u64, @bitCast(ops.offset)))),
+        .flags = 0, .imm = @as(u32, @truncate(@as(u64, @bitCast(load_offset)))),
     });
+    if (ops.writeback and ops.post_index) {
+        // Post-index: load from [Rn], then Rn += offset
+        try emitMemWriteback(buf, allocator, ops.rn, ops.offset);
+    }
 }
 
 fn buildStore(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag, _: bool) !void {
     const ops = inst.operands.mem_imm;
+    const is_pre_index = ops.writeback and !ops.post_index;
+    if (is_pre_index) {
+        try emitMemWriteback(buf, allocator, ops.rn, ops.offset);
+    }
     const base = try spBase(buf, allocator, ops.rn);
+    const store_offset: i64 = if (ops.writeback) 0 else ops.offset;
     try buf.append(allocator, .{
         .tag = tag, .dest = 0, .src0 = base, .src1 = ops.rt,
-        .flags = 0, .imm = @as(u32, @truncate(@as(u64, @bitCast(ops.offset)))),
+        .flags = 0, .imm = @as(u32, @truncate(@as(u64, @bitCast(store_offset)))),
     });
+    if (ops.writeback and ops.post_index) {
+        try emitMemWriteback(buf, allocator, ops.rn, ops.offset);
+    }
 }
 
 fn buildLoadReg(buf: *IRBuffer, allocator: std.mem.Allocator, inst: A64Inst, tag: Tag, _: u64) !void {
@@ -1049,6 +1104,18 @@ test "CMP → IR (NZCV update)" {
     try std.testing.expectEqual(@as(usize, 2), buf.ops.items.len);
     try std.testing.expectEqual(Tag.sub_i64, buf.ops.items[0].tag);
     try std.testing.expectEqual(Tag.nzcv_update, buf.ops.items[1].tag);
+}
+
+test "ADRP → IR (page offset)" {
+    var buf: IRBuffer = .{};
+    defer buf.deinit(std.testing.allocator);
+    // adrp x7, 0x5b5000 at 0x405944 (encoding 0x90000D87 from bb_arm64).
+    // The imm21 field is a page offset: target = PC_page + imm21<<12 = 0x5b5000.
+    const inst = Decode.decode(0x90000D87);
+    try build(&buf, std.testing.allocator, inst, 0x405944);
+    try std.testing.expectEqual(@as(usize, 1), buf.ops.items.len);
+    try std.testing.expectEqual(Tag.add_i64, buf.ops.items[0].tag);
+    try std.testing.expectEqual(@as(u32, 0x5B5000), buf.ops.items[0].imm);
 }
 
 test "BIC → IR (decomposed)" {

@@ -103,8 +103,10 @@ fn threeOp(
 // ── ALU emission ───────────────────────────────────────────────────
 
 fn emitAdd(ctx: *EmitContext, op: IROp) void {
-    if (isXzr(op.dest)) return;
-    const dst = mapReg(ctx.regmap, op.dest);
+    // XZR dest = CMN: the result is discarded but the flags must be set.
+    // Compute into R14 (scratch; only clobbered by BR/BLR L1 checks, which
+    // come at region end, and by the .cond tail, which runs after this).
+    const dst = if (isXzr(op.dest)) X86Reg.r14 else mapReg(ctx.regmap, op.dest);
     const src0_is_xzr = isXzr(op.src0);
     const cond = op.flags;
 
@@ -117,6 +119,13 @@ fn emitAdd(ctx: *EmitContext, op: IROp) void {
     if (op.imm != 0) {
         if (src0_is_xzr) {
             emitMovCst(ctx, dst, op.imm);
+            if (isXzr(op.dest)) {
+                // CMN XZR, #imm: MOV sets no flags — force flag-setting ADD
+                ctx.rex(true, 0, 0, @intFromEnum(dst));
+                ctx.byte(0x83);
+                ctx.modrm(0b11, 0, @intFromEnum(dst));
+                ctx.byte(0); // ADD r/m64, imm8 0
+            }
         } else {
             const src0 = mapReg(ctx.regmap, op.src0);
             threeOp(ctx, dst, src0);
@@ -179,8 +188,10 @@ fn emitCSel(ctx: *EmitContext, dst: X86Reg, rn: X86Reg, rm: X86Reg, arm_cond: u1
 }
 
 fn emitSub(ctx: *EmitContext, op: IROp) void {
-    if (isXzr(op.dest)) return;
-    const dst = mapReg(ctx.regmap, op.dest);
+    // XZR dest = CMP: the result is discarded but the flags must be set.
+    // Compute into R14 (scratch; only clobbered by BR/BLR L1 checks, which
+    // come at region end, and by the .cond tail, which runs after this).
+    const dst = if (isXzr(op.dest)) X86Reg.r14 else mapReg(ctx.regmap, op.dest);
     const src0_is_xzr = isXzr(op.src0);
 
     if (op.imm != 0) {
@@ -212,13 +223,29 @@ fn emitSub(ctx: *EmitContext, op: IROp) void {
         ctx.rex(true, @intFromEnum(src1), 0, @intFromEnum(dst));
         ctx.byte(0x29);
         ctx.modrm(0b11, @intFromEnum(src1), @intFromEnum(dst));
-    } else if (!isXzr(op.dest)) {
-        // src0 only (no immediate, no src1): just copy/move
-        if (!src0_is_xzr) {
-            const src0 = mapReg(ctx.regmap, op.src0);
-            emitMovReg(ctx, dst, src0);
-        } else {
-            // 0 - 0 = 0
+    } else {
+        // src0 only (no immediate, no src1)
+        if (src0_is_xzr) {
+            // 0 - 0 = 0: only flags matter when dest is XZR (CMP XZR, XZR)
+            if (isXzr(op.dest)) {
+                ctx.rex(true, 0, 0, @intFromEnum(X86Reg.r14));
+                ctx.byte(0x31);
+                ctx.modrm(0b11, @intFromEnum(X86Reg.r14), @intFromEnum(X86Reg.r14)); // XOR r14, r14 → Z=1
+                ctx.rex(true, 0, 0, @intFromEnum(X86Reg.r14));
+                ctx.byte(0x83);
+                ctx.modrm(0b11, 5, @intFromEnum(X86Reg.r14));
+                ctx.byte(0); // SUB r14, 0 → CF=0 (no borrow)
+            }
+            return;
+        }
+        const src0 = mapReg(ctx.regmap, op.src0);
+        threeOp(ctx, dst, src0);
+        if (isXzr(op.dest)) {
+            // CMP Xn, XZR: MOV alone sets no flags — force a flag-setting SUB
+            ctx.rex(true, 0, 0, @intFromEnum(dst));
+            ctx.byte(0x83);
+            ctx.modrm(0b11, 5, @intFromEnum(dst));
+            ctx.byte(0); // SUB r/m64, imm8 0 → CF=0 (no borrow), Z/SF from src0
         }
     }
 }
@@ -301,8 +328,8 @@ fn emitMulHiU(ctx: *EmitContext, op: IROp) void {
 }
 
 fn emitLogical(ctx: *EmitContext, op: IROp, opcode_byte: u8) void {
-    if (isXzr(op.dest)) return;
-    const dst = mapReg(ctx.regmap, op.dest);
+    // XZR dest = TST: result discarded, flags must be set — use R14 scratch.
+    const dst = if (isXzr(op.dest)) X86Reg.r14 else mapReg(ctx.regmap, op.dest);
     const src0 = mapReg(ctx.regmap, op.src0);
 
     threeOp(ctx, dst, src0);

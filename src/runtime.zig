@@ -21,6 +21,7 @@ const GdbJit = @import("gdbjit.zig");
 // Dynamic linker (dlopen/dlsym) for host library thunking
 extern fn dlopen(filename: [*:0]const u8, flags: i32) ?*anyopaque;
 extern fn dlsym(handle: *anyopaque, name: [*:0]const u8) ?*anyopaque;
+extern fn getenv(name: [*:0]const u8) ?[*:0]u8;
 
 const IRB = Ir.IRBuffer;
 const IROp = Ir.IROp;
@@ -158,7 +159,7 @@ pub const JitRuntime = struct {
             -1, 0,
         );
         runtime.guest_stack = stack_page;
-        runtime.state.sp = @intFromPtr(stack_page.ptr) + guest_stack_size - 4096;
+        JitRuntime.stateSpPtr(&runtime.state).* = @intFromPtr(stack_page.ptr) + guest_stack_size - 4096;
 
         // Handle dynamic linking if present
         const e_phoff = std.mem.readInt(u64, elf_bytes[32..40], .little);
@@ -169,9 +170,20 @@ pub const JitRuntime = struct {
     }
 
 
+    /// Access state.sp through raw pointer arithmetic: Zig 0.17 computes the
+    /// sp field at offset 1272 instead of the real 248 (compiler bug), so
+    /// `runtime.state.sp` reads/writes garbage while the LLVM backend's
+    /// store-back uses the true offset. All guest SP traffic must go through
+    /// this helper.
+    fn stateSpPtr(state_ptr: *State.Arm64State) *u64 {
+        return @as(*u64, @ptrFromInt(@intFromPtr(state_ptr) + 248));
+    }
+
     fn isBlockEnd(opcode: Decode.Opcode) bool {
         return switch (opcode) {
-            .b, .bl, .br, .blr, .ret_, .b_cond, .svc => true,
+            .b, .bl, .br, .blr, .ret_, .b_cond, .svc,
+            .cbz, .cbnz, .tbz, .tbnz, // conditional branch-and-test: terminal
+            => true,
             else => false,
         };
     }
@@ -196,6 +208,9 @@ pub const JitRuntime = struct {
         const MAX_BLOCK_INSTRS_PER_REGION: u32 = MAX_BLOCK_INSTRS * 4;
         var ir_buf: IRB = .{};
         defer ir_buf.deinit(runtime.allocator);
+        if (getenv("A64TOX64_DUMPCOND") != null and guest_pc == 0x40599C) {
+            std.debug.print("IR for 0x40599C:\n", .{});
+        }
 
         // Cache guest memory pointer locally to avoid repeated struct dereference
         const guest_mem_local = runtime.guest_mem orelse @panic("guest memory not set");
@@ -219,12 +234,19 @@ pub const JitRuntime = struct {
                 // B/BL: imm26 at bits 25-0, sign-extended << 2
                 const imm26: i64 = @as(i64, @as(i26, @bitCast(@as(u26, @truncate(raw & 0x03FFFFFF)))));
                 last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm26 << 2)));
-            } else if (cur_opcode == .b_cond) {
+            } else if (cur_opcode == .b_cond or cur_opcode == .cbz or cur_opcode == .cbnz) {
+                // B.cond/CBZ/CBNZ: imm19 at bits 23-5, sign-extended << 2
                 const imm19: i64 = @as(i64, @as(i19, @bitCast(@as(u19, @truncate((raw >> 5) & 0x7FFFF)))));
                 last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm19 << 2)));
+            } else if (cur_opcode == .tbz or cur_opcode == .tbnz) {
+                // TBZ/TBNZ: imm14 at bits 18-5, sign-extended << 2
+                const imm14: i64 = @as(i64, @as(i14, @bitCast(@as(u14, @truncate((raw >> 5) & 0x3FFF)))));
+                last_target = @as(u64, @intCast(@as(i64, @intCast(pc)) + (imm14 << 2)));
             }
 
             // Build IR for this instruction
+            if (getenv("A64TOX64_DUMPCOND") != null and guest_pc == 0x40599C)
+                std.debug.print("  op {s} raw=0x{X:08} ops={any}\n", .{ @tagName(decoded.opcode), raw, decoded.operands });
             try IrB.build(&ir_buf, runtime.allocator, decoded, pc);
             count += 1;
             pc += 4;
@@ -255,6 +277,12 @@ pub const JitRuntime = struct {
             }
         }
         if (count == 0) return error.EmptyRegion;
+        if (getenv("A64TOX64_DUMPCOND") != null and guest_pc == 0x40599C) {
+            for (ir_buf.ops.items) |op| {
+                if (op.tag == .store_u64 or op.tag == .load_u64)
+                    std.debug.print("  IR {s} dest={} src0={} src1={} imm=0x{X}\n", .{ @tagName(op.tag), op.dest, op.src0, op.src1, op.imm });
+            }
+        }
         // Decide backend: LLVM for blocks with x14+ regs or SIMD ops;
         // hand-written emitter for the common case.
         const use_llvm = LlvmBackend.shouldUseLlvm(ir_buf.ops.items);
@@ -266,7 +294,7 @@ pub const JitRuntime = struct {
                 tb.regmap = Emit.RegisterMap{ null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null }; // LLVM stores state internally
                 tb.chain_type = switch (last_opcode) {
                     .b => .direct,
-                    .b_cond => .cond,
+                    .b_cond, .cbz, .cbnz, .tbz, .tbnz => .cond,
                     .bl => .call,
                     else => .none,
                 };
@@ -294,13 +322,33 @@ pub const JitRuntime = struct {
             }
             break :a RegAlloc.allocateAdv(ir_buf.ops.items, 1.0, null);
         };
-        const emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
+        var emitted = Emit.emitBlock(cpage, &regmap, ir_buf.ops.items);
+        // Conditional-branch blocks (hand emitter): the block ends with
+        // "Jcc rel32=0" (6 bytes, no RET). Patch the Jcc to jump to a small
+        // tail that reports the branch outcome:
+        //   not taken: xor r14, r14; ret          → R14 = 0
+        //   taken:     mov r14, imm64; ret        → R14 = chain_target (guest pc)
+        // The runtime's .cond dispatch reads R14 (never a mapped guest reg,
+        // clobbered only after the last use) to pick the successor. This
+        // keeps single execution: no hardware jump into the target block.
+        if ((last_opcode == .b_cond or last_opcode == .cbz or last_opcode == .cbnz or last_opcode == .tbz or last_opcode == .tbnz) and emitted.len >= 6) {
+            const jcc_tail: [15]u8 = .{
+                0x4D, 0x31, 0xF6, 0xC3, // xor r14, r14; ret
+                0x49, 0xBE, 0, 0, 0, 0, 0, 0, 0, 0, 0xC3, // mov r14, imm64; ret
+            };
+            // rel32 = 4 → jump past xor(3) + ret(1) to the mov r14, imm64
+            std.mem.writeInt(i32, emitted[emitted.len - 4 ..][0..4], 4, .little);
+            @memcpy(cpage[emitted.len..][0..jcc_tail.len], &jcc_tail);
+            // imm64 slot: tail = [4D 31 F6] [C3] [49 BE] [imm64×8] [C3]
+            std.mem.writeInt(u64, cpage[emitted.len + 6 ..][0..8], last_target, .little);
+            emitted.len += jcc_tail.len;
+        }
 const tb = try runtime.cache.allocateBlock();
         tb.* = TranslationBlock.init(guest_pc, cpage[0..emitted.len]);
         tb.regmap = regmap;
         tb.chain_type = switch (last_opcode) {
             .b => .direct,
-            .b_cond => .cond,
+            .b_cond, .cbz, .cbnz, .tbz, .tbnz => .cond,
             .bl => .call,
             else => .none,
         };
@@ -309,37 +357,13 @@ const tb = try runtime.cache.allocateBlock();
         try runtime.cache.insert(tb);
         Signal.registerBlock(tb.host_addr, tb.guest_pc);
 
-        // Hardware chaining: patch JMP/CALL placeholders if target already translated
-        if (emitted.len >= 6 and last_opcode != .ret_ and last_opcode != .svc) {
-            const branch_kind: enum { jmp, jcc, call, none } = brk: {
-                // JMP (E9 rel32) — 5 bytes at end: E9 xx xx xx xx
-                if (emitted.len >= 5 and emitted[emitted.len - 5] == 0xE9) break :brk .jmp;
-                // CALL+RET (E8 rel32 C3) — 6 bytes: E8 xx xx xx xx C3
-                if (emitted.len >= 6 and emitted[emitted.len - 6] == 0xE8 and emitted[emitted.len - 1] == 0xC3) break :brk .call;
-                // JCC (0F 8x rel32) — 6 bytes: 0F 8x xx xx xx xx
-                if (emitted.len >= 6 and emitted[emitted.len - 6] == 0x0F) {
-                    const second = emitted[emitted.len - 5];
-                    if (second >= 0x80 and second <= 0x8F) break :brk .jcc;
-                }
-                break :brk .none;
-            };
-            // Patch rel32 for JMP and CALL if target already translated
-            if ((branch_kind == .jmp and tb.chain_type == .direct) or
-                (branch_kind == .call and tb.chain_type == .call))
-            {
-                const patch_offset = blk: {
-                    if (branch_kind == .call) break :blk emitted.len - 5; // rel32 before C3
-                    break :blk emitted.len - 4; // JMP rel32 at last 4 bytes
-                };
-                if (runtime.cache.lookup(tb.chain_target)) |target_blk| {
-                    const src_end = @intFromPtr(emitted.ptr) + emitted.len -
-                        if (branch_kind == .call) @as(usize, 1) else 0;
-                    const target_addr = @intFromPtr(target_blk.host_addr.ptr);
-                    const rel32: i32 = @intCast(target_addr - src_end);
-                    std.mem.writeInt(i32, emitted[patch_offset..][0..4], rel32, .little);
-                }
-            }
-        }
+        // NOTE: hardware JMP/CALL chaining is deliberately NOT patched here.
+        // A patched JMP/CALL makes the target run inline; when the chain's
+        // terminal RET returns to execAtGuest, the runtime dispatch would
+        // re-run the target (double execution) and could never continue at
+        // the caller's return address. The runtime dispatch below (with the
+        // fallthrough continuation) gives single-execution semantics. The
+        // Jcc placeholder is patched above with the outcome-reporting tail.
 
         runtime.last_block_was_svc = ends_with_svc;
         runtime.last_block_next_pc = pc;
@@ -421,9 +445,24 @@ const tb = try runtime.cache.allocateBlock();
         // register-allocation interference with the state pointer argument.
         // Hand-emitter blocks: inline asm captures all host registers.
         runtime.indirect_target = 0;
+        var llvm_block_ret: u64 = 0;
+        var hand_block_ret: u64 = 0; // .cond outcome from hand-emitter blocks (R14)
+        // Hoist the state pointer into a plain local: Zig 0.17 computes some
+        // struct-field addresses with a wrong offset (same bug the execAtGuest
+        // asm works around), which would make the LLVM block read/write
+        // garbage state (observed: state.sp never updated by LLVM store-back).
+        const state_ptr = &runtime.state;
+        const state_sp = JitRuntime.stateSpPtr(&runtime.state).*;
         if (block.regmap[0] == null) {
-            const fn2: *const fn (*anyopaque, u64) callconv(.c) void = @ptrCast(@alignCast(block.host_addr.ptr));
-            fn2(&runtime.state, runtime.state.sp);
+            // LLVM blocks return the taken branch target (0 = not taken) so
+            // the runtime can dispatch .cond successors without hardware chaining.
+            const fn2: *const fn (*anyopaque, u64) callconv(.c) u64 = @ptrCast(@alignCast(block.host_addr.ptr));
+            llvm_block_ret = fn2(state_ptr, state_sp);
+            if (getenv("A64TOX64_DUMPCOND") != null) {
+                const base = @intFromPtr(block.host_addr.ptr);
+                const spg = @as(*const u64, @ptrFromInt(base - 0x1000)).*;                const sp_after = JitRuntime.stateSpPtr(&runtime.state).*;
+                std.debug.print("LLVM run pc=0x{X:016} sp {X:016}->{X:016} spg={X:016} state={X:016} ret={X:016}\n", .{ block.guest_pc, state_sp, sp_after, spg, @intFromPtr(state_ptr), llvm_block_ret });
+            }
         } else {
         var cap_rdi: u64 = undefined;
         var cap_rsi: u64 = undefined;
@@ -440,7 +479,7 @@ const tb = try runtime.cache.allocateBlock();
         var cap_r13: u64 = undefined;
         var cap_r14: u64 = undefined;
         var cap_r15: u64 = undefined;
-        const guest_sp = runtime.state.sp;
+        const guest_sp = JitRuntime.stateSpPtr(&runtime.state).*;
         // Workaround for a Zig 0.17 self-hosted codegen bug: struct-field
         // addresses inside inline-asm operands are computed with a WRONG
         // field offset (e.g. state at 0x1200 instead of its real offset),
@@ -525,7 +564,9 @@ const tb = try runtime.cache.allocateBlock();
 
         // R15 holds the live guest SP — save back to state for next block
         // LLVM blocks save state themselves (compileBlock store-back).
-            runtime.state.sp = cap_r15;
+        // R14 holds the .cond outcome (taken target or 0) for hand blocks.
+            hand_block_ret = cap_r14;
+            JitRuntime.stateSpPtr(&runtime.state).* = cap_r15;
             for (block.regmap, 0..) |maybe_host, arm_i| {
                 const val = if (maybe_host) |host| switch (host) {
                     .rdi => cap_rdi, .rsi => cap_rsi, .rdx => cap_rdx,
@@ -551,18 +592,35 @@ const tb = try runtime.cache.allocateBlock();
         if (!runtime.last_block_was_svc and block.chain_type == .direct) {
             runtime.storeHints(exit_hints);
             runtime.last_block_pc = block.guest_pc;
+            if (getenv("A64TOX64_DUMPCOND") != null)
+                std.debug.print("DIRECT dispatch pc=0x{X:016} -> 0x{X:016}\n", .{ block.guest_pc, block.chain_target });
             runtime.executeInner(block.chain_target, depth + 1);
             return;
         }
-        // BL (call): ensure target is translated, then recursively execute it.
-        // If hardware chaining patched the CALL rel32, the block's CALL jumps
-        // directly and the target's RET + our RET returns to execute().
-        // If not patched (target wasn't cached at translation time), the CALL
-        // falls through to RET and we handle it here.
+        // BL (call): run the callee, then continue at the return address
+        // (the block's fallthrough, i.e. the instruction after the BL).
         if (!runtime.last_block_was_svc and block.chain_type == .call) {
             runtime.storeHints(exit_hints);
             runtime.last_block_pc = block.guest_pc;
+            if (getenv("A64TOX64_DUMPCOND") != null)
+                std.debug.print("CALL dispatch pc=0x{X:016} -> 0x{X:016} ret=0x{X:016} sp=0x{X:016}\n", .{ block.guest_pc, block.chain_target, block.fallthrough_pc, JitRuntime.stateSpPtr(&runtime.state).* });
             runtime.executeInner(block.chain_target, depth + 1);
+            // Callee returned: resume at the return address.
+            runtime.executeInner(block.fallthrough_pc, depth + 1);
+            return;
+        }
+        // Conditional branch: the block reported its outcome —
+        // hand-emitter blocks leave it in R14 (captured as cap_r14),
+        // LLVM blocks return it from fn2. Zero means "not taken".
+        if (block.chain_type == .cond) {
+            runtime.last_block_pc = block.guest_pc;
+            const taken_target: u64 = if (block.regmap[0] == null)
+                llvm_block_ret
+            else
+                hand_block_ret;
+            if (getenv("A64TOX64_DUMPCOND") != null)
+                std.debug.print("COND dispatch pc=0x{X:016} llvm={} taken=0x{X:016} ft=0x{X:016} sp=0x{X:016}\n", .{ block.guest_pc, block.regmap[0] == null, taken_target, block.fallthrough_pc, JitRuntime.stateSpPtr(&runtime.state).* });
+            runtime.executeInner(if (taken_target != 0) taken_target else block.fallthrough_pc, depth + 1);
             return;
         }
         // SVC or indirect: handle normally
@@ -1020,7 +1078,7 @@ const tb = try runtime.cache.allocateBlock();
         var cap_r13: u64 = undefined;
         var cap_r14: u64 = undefined;
         var cap_r15: u64 = undefined;
-        const guest_sp = runtime.state.sp;
+        const guest_sp = JitRuntime.stateSpPtr(&runtime.state).*;
         // Same Zig 0.17 struct-offset-in-asm-operand bug workaround as
         // executeInner: hoist state-derived values into locals first.
         const x0v = runtime.state.x[0];
@@ -1337,6 +1395,113 @@ test "block entry loads x0-x7 from state" {
     runtime.state.x[2] = 23;
     runtime.execute(runtime.state.pc, 0);
     try std.testing.expectEqual(@as(u64, 1023), runtime.state.x[0]);
+}
+
+test "CBZ taken (hand emitter)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    // MOVZ X0,#0; CBZ X0,+8; MOVZ X0,#1; RET → branch taken, X0 stays 0
+    const code = [_]u8{
+        0x00, 0x00, 0x80, 0xD2, // MOVZ X0, #0
+        0x40, 0x00, 0x00, 0xB4, // CBZ X0, +8 (skip MOVZ X0,#1)
+        0x20, 0x00, 0x80, 0xD2, // MOVZ X0, #1
+        0xC0, 0x03, 0x5F, 0xD6, // RET
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 0), runtime.state.x[0]);
+}
+
+test "CBZ not taken (hand emitter)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    // MOVZ X0,#1; CBZ X0,+8; MOVZ X0,#2; RET → not taken, X0 = 2
+    const code = [_]u8{
+        0x20, 0x00, 0x80, 0xD2, // MOVZ X0, #1
+        0x40, 0x00, 0x00, 0xB4, // CBZ X0, +8 (skip MOVZ X0,#2)
+        0x40, 0x00, 0x80, 0xD2, // MOVZ X0, #2
+        0xC0, 0x03, 0x5F, 0xD6, // RET
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 2), runtime.state.x[0]);
+}
+
+test "B.EQ after CMP taken (hand emitter)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    // MOVZ X1,#5; MOVZ X2,#5; CMP X1,X2; B.EQ +8; MOVZ X0,#1; MOVZ X0,#7; RET
+    // → EQ taken, X0 = 7
+    const code = [_]u8{
+        0xA1, 0x00, 0x80, 0xD2, // MOVZ X1, #5
+        0xA2, 0x00, 0x80, 0xD2, // MOVZ X2, #5
+        0x3F, 0x00, 0x02, 0xEB, // CMP X1, X2
+        0x40, 0x00, 0x00, 0x54, // B.EQ +8 (skip MOVZ X0,#1)
+        0x20, 0x00, 0x80, 0xD2, // MOVZ X0, #1
+        0xE0, 0x00, 0x80, 0xD2, // MOVZ X0, #7
+        0xC0, 0x03, 0x5F, 0xD6, // RET
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 7), runtime.state.x[0]);
+}
+
+test "B.EQ after CMP not taken (hand emitter)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    // MOVZ X1,#5; MOVZ X2,#6; CMP X1,X2; B.EQ +8; MOVZ X0,#1; RET
+    // → not taken, X0 = 1
+    const code = [_]u8{
+        0xA1, 0x00, 0x80, 0xD2, // MOVZ X1, #5
+        0xC2, 0x00, 0x80, 0xD2, // MOVZ X2, #6
+        0x3F, 0x00, 0x02, 0xEB, // CMP X1, X2
+        0x40, 0x00, 0x00, 0x54, // B.EQ +8 (skip MOVZ X0,#1)
+        0x20, 0x00, 0x80, 0xD2, // MOVZ X0, #1
+        0xC0, 0x03, 0x5F, 0xD6, // RET
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 1), runtime.state.x[0]);
+}
+
+test "CBZ taken in high-register block (LLVM backend)" {
+    var runtime = JitRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    // 16 MOVZ (x0-x15, >12 unique regs → LLVM backend) + CBZ X0 taken → X0 = 0
+    const code = [_]u8{
+        0x00, 0x00, 0x80, 0xD2, // MOVZ X0, #0
+        0x21, 0x00, 0x80, 0xD2, // MOVZ X1, #1
+        0x42, 0x00, 0x80, 0xD2, // MOVZ X2, #2
+        0x63, 0x00, 0x80, 0xD2, // MOVZ X3, #3
+        0x84, 0x00, 0x80, 0xD2, // MOVZ X4, #4
+        0xA5, 0x00, 0x80, 0xD2, // MOVZ X5, #5
+        0xC6, 0x00, 0x80, 0xD2, // MOVZ X6, #6
+        0xE7, 0x00, 0x80, 0xD2, // MOVZ X7, #7
+        0x08, 0x01, 0x80, 0xD2, // MOVZ X8, #8
+        0x29, 0x01, 0x80, 0xD2, // MOVZ X9, #9
+        0x4A, 0x01, 0x80, 0xD2, // MOVZ X10, #10
+        0x6B, 0x01, 0x80, 0xD2, // MOVZ X11, #11
+        0x8C, 0x01, 0x80, 0xD2, // MOVZ X12, #12
+        0xAD, 0x01, 0x80, 0xD2, // MOVZ X13, #13
+        0xCE, 0x01, 0x80, 0xD2, // MOVZ X14, #14
+        0xEF, 0x01, 0x80, 0xD2, // MOVZ X15, #15
+        0x40, 0x00, 0x00, 0xB4, // CBZ X0, +8 (skip MOVZ X0,#1)
+        0x20, 0x00, 0x80, 0xD2, // MOVZ X0, #1
+        0xC0, 0x03, 0x5F, 0xD6, // RET
+    };
+    const elf = try Elf.buildMinimalElf(std.testing.allocator, &code);
+    defer std.testing.allocator.free(elf);
+    try runtime.loadElf(elf);
+    runtime.execute(runtime.state.pc, 0);
+    try std.testing.expectEqual(@as(u64, 0), runtime.state.x[0]);
 }
 
 test "invalidateL2ForGuestPage clears only matching page entries" {

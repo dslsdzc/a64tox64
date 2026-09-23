@@ -193,7 +193,7 @@ pub const Operands = union(enum) {
     ri16: struct { rd: u5, imm16: u16 },
     ri16_hw: struct { rd: u5, imm16: u16, hw: u2 },
     rl: struct { rd: u5, label: i64 },
-    mem_imm: struct { rt: u5, rn: u5, offset: i64, size: u2 },
+    mem_imm: struct { rt: u5, rn: u5, offset: i64, size: u2, writeback: bool = false, post_index: bool = false },
     mem_reg: struct { rt: u5, rn: u5, rm: u5, extend: ExtendType, amount: u3 },
     ldp_stp: struct { rt1: u5, rt2: u5, rn: u5, imm7: i7, load: bool, post_index: bool, writeback: bool },
     b_target: struct { label: i64 },
@@ -475,12 +475,31 @@ const opcode_table = [_]OpcodeEntry{
     .{ .mask = 0xFFC00000, .value = 0xF9000000, .opcode = .str_imm },  // STR (64-bit)
     .{ .mask = 0xFFC00000, .value = 0xB9400000, .opcode = .ldr_imm },  // LDR (32-bit)
     .{ .mask = 0xFFC00000, .value = 0xF9400000, .opcode = .ldr_imm },  // LDR (64-bit)
+    // LDR/STR (immediate, post/pre-index). Bits 25-24 = 00 with bits 11-10
+    // distinguishing: 01 = post-index, 11 = pre-index (00 = LDUR, unscaled —
+    // no writeback, matched by no entry here). imm9 at bits 20-12.
+    .{ .mask = 0xFFC00C00, .value = 0xF8400400, .opcode = .ldr_imm },  // LDR 64 post-index
+    .{ .mask = 0xFFC00C00, .value = 0xF8400C00, .opcode = .ldr_imm },  // LDR 64 pre-index
+    .{ .mask = 0xFFC00C00, .value = 0xB8400400, .opcode = .ldr_imm },  // LDR 32 post-index
+    .{ .mask = 0xFFC00C00, .value = 0xB8400C00, .opcode = .ldr_imm },  // LDR 32 pre-index
+    .{ .mask = 0xFFC00C00, .value = 0xF8000400, .opcode = .str_imm },  // STR 64 post-index
+    .{ .mask = 0xFFC00C00, .value = 0xF8000C00, .opcode = .str_imm },  // STR 64 pre-index
+    .{ .mask = 0xFFC00C00, .value = 0xB8000400, .opcode = .str_imm },  // STR 32 post-index
+    .{ .mask = 0xFFC00C00, .value = 0xB8000C00, .opcode = .str_imm },  // STR 32 pre-index
     // LDR/STR (immediate, scaled) — 8-bit
     .{ .mask = 0xFFC00000, .value = 0x39000000, .opcode = .strb_imm }, // STRB
     .{ .mask = 0xFFC00000, .value = 0x39400000, .opcode = .ldrb_imm }, // LDRB
+    .{ .mask = 0xFFC00C00, .value = 0x38000400, .opcode = .strb_imm }, // STRB post-index
+    .{ .mask = 0xFFC00C00, .value = 0x38000C00, .opcode = .strb_imm }, // STRB pre-index
+    .{ .mask = 0xFFC00C00, .value = 0x38400400, .opcode = .ldrb_imm }, // LDRB post-index
+    .{ .mask = 0xFFC00C00, .value = 0x38400C00, .opcode = .ldrb_imm }, // LDRB pre-index
     // LDR/STR (immediate, scaled) — 16-bit
     .{ .mask = 0xFFC00000, .value = 0x79000000, .opcode = .strh_imm }, // STRH
     .{ .mask = 0xFFC00000, .value = 0x79400000, .opcode = .ldrh_imm }, // LDRH
+    .{ .mask = 0xFFC00C00, .value = 0x78000400, .opcode = .strh_imm }, // STRH post-index
+    .{ .mask = 0xFFC00C00, .value = 0x78000C00, .opcode = .strh_imm }, // STRH pre-index
+    .{ .mask = 0xFFC00C00, .value = 0x78400400, .opcode = .ldrh_imm }, // LDRH post-index
+    .{ .mask = 0xFFC00C00, .value = 0x78400C00, .opcode = .ldrh_imm }, // LDRH pre-index
     // LDR (literal)
     .{ .mask = 0xFF000000, .value = 0x18000000, .opcode = .ldr_literal },
     // LDRSW (literal)
@@ -691,11 +710,23 @@ fn extractCCmpImm(raw: u32) Operands {
 fn extractMemImm(raw: u32) Operands {
     const rt: u5 = @truncate(raw);
     const rn: u5 = @truncate(raw >> 5);
-    const imm12: u12 = @truncate(raw >> 10);
     const size: u2 = @truncate(raw >> 30);
-    const scale: u9 = @as(u9, 1) << @intCast(size);
-    const offset: i64 = @as(i64, imm12) * @as(i64, scale);
-    return .{ .mem_imm = .{ .rt = rt, .rn = rn, .offset = offset, .size = size } };
+    // Post/pre-index forms have bits 25-24 = 00 (LDUR unscaled too, but the
+    // table only routes the writeback forms here); bits 11-10: 01 = post,
+    // 11 = pre. imm9 at bits 20-12 (sign-extended); unsigned forms use
+    // imm12 at bits 21-10 scaled by the element size.
+    const writeback: bool = ((raw >> 24) & 0b11) == 0;
+    const post_index: bool = writeback and ((raw >> 11) & 1) == 0;
+    var offset: i64 = undefined;
+    if (writeback) {
+        const imm9: i9 = @bitCast(@as(u9, @truncate(raw >> 12)));
+        offset = @as(i64, imm9);
+    } else {
+        const imm12: u12 = @truncate(raw >> 10);
+        const scale: u9 = @as(u9, 1) << @intCast(size);
+        offset = @as(i64, imm12) * @as(i64, scale);
+    }
+    return .{ .mem_imm = .{ .rt = rt, .rn = rn, .offset = offset, .size = size, .writeback = writeback, .post_index = post_index } };
 }
 
 fn extractLiteral(raw: u32) Operands {

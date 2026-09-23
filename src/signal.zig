@@ -159,6 +159,12 @@ fn putHex(v: u64) void {
 
 fn putStr(s: []const u8) void { _ = linux.write(2, s.ptr, s.len); }
 
+fn putHexByte(v: u8) void {
+    const hex = "0123456789abcdef";
+    var buf: [2]u8 = .{ hex[v >> 4], hex[v & 0xF] };
+    _ = linux.write(2, &buf, 2);
+}
+
 /// Check if a guest memory page has cached translations (SMC candidate).
 /// Returns the guest page number or 0 if no translations exist.
 fn guestPageWithTranslations(fault_addr: u64) u64 {
@@ -224,6 +230,29 @@ fn handler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) c
         // findBlock(rip) is non-null here (in_jit); print the guest PC
         if (findBlock(rip)) |pc| {
             putStr("Guest PC:   "); putHex(pc); putStr("\n");
+        }
+        // Dump host code around RIP (JIT block bytes) for debugging to /tmp/jit_dump.bin
+        {
+            var start: usize = rip -| 2048;
+            var bi: usize = 0;
+            while (bi < block_count) : (bi += 1) {
+                if (rip >= block_ranges[bi].start and rip < block_ranges[bi].end) {
+                    start = block_ranges[bi].start;
+                    break;
+                }
+            }
+            const fd = linux.open("/tmp/jit_dump.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+            if (fd > 0) {
+                var hp: usize = start;
+                var buf: [4096]u8 = undefined;
+                var n: usize = 0;
+                while (hp < rip + 128 and n < buf.len) : (hp += 1) {
+                    buf[n] = @as(*const u8, @ptrFromInt(hp)).*;
+                    n += 1;
+                }
+                _ = linux.write(@intCast(fd), &buf, n);
+                _ = linux.close(@intCast(fd));
+            }
         }
         putStr("\nRAX="); putHex(gregs[13]); putStr(" RBX="); putHex(gregs[11]);
         putStr(" RCX="); putHex(gregs[14]); putStr(" RDX="); putHex(gregs[12]);

@@ -143,6 +143,8 @@ extern fn LLVMAppendBasicBlock(ValueRef, [*:0]const u8) ValueRef;
 extern fn LLVMInt64Type() TypeRef;
 extern fn LLVMInt32Type() TypeRef;
 extern fn LLVMInt8Type() TypeRef;
+extern fn LLVMInt16Type() TypeRef;
+extern fn LLVMInt1Type() TypeRef;
 extern fn LLVMVoidType() TypeRef;
 extern fn LLVMPointerType(TypeRef, c_uint) TypeRef;
 extern fn LLVMFunctionType(TypeRef, [*]const TypeRef, c_uint, c_uint) TypeRef;
@@ -171,10 +173,12 @@ extern fn LLVMBuildLShr(BuilderRef, ValueRef, ValueRef, [*:0]const u8) ValueRef;
 extern fn LLVMBuildAShr(BuilderRef, ValueRef, ValueRef, [*:0]const u8) ValueRef;
 extern fn LLVMBuildGEP2(BuilderRef, TypeRef, ValueRef, [*]const ValueRef, c_uint, [*:0]const u8) ValueRef;
 extern fn LLVMBuildRetVoid(BuilderRef) ValueRef;
+extern fn LLVMBuildRet(BuilderRef, ValueRef) ValueRef;
 extern fn LLVMBuildPtrToInt(BuilderRef, ValueRef, TypeRef, [*:0]const u8) ValueRef;
 extern fn LLVMBuildIntToPtr(BuilderRef, ValueRef, TypeRef, [*:0]const u8) ValueRef;
 extern fn LLVMBuildBr(BuilderRef, ValueRef) ValueRef;
 extern fn LLVMVerifyFunction(ValueRef, c_uint) void;
+extern fn LLVMPrintModuleToFile(ModuleRef, [*:0]const u8, [*c]?[*:0]u8) c_int;
 extern fn LLVMGetErrorMessage(ErrorRef) [*:0]const u8;
 extern fn LLVMDisposeErrorMessage([*:0]const u8) void;
 
@@ -397,7 +401,6 @@ pub fn compileBlock(ops: []const IROp, guest_pc: u64) ?[]u8 {
     const i64_ty = LLVMInt64Type();
     const i32_ty = LLVMInt32Type();
     const i8_ty = LLVMInt8Type();
-    const void_ty = LLVMVoidType();
     const f32_ty = LLVMFloatType();
     const v4f32_ty = LLVMVectorType(f32_ty, 4);  // 128-bit NEON vector
     const v4i32_ty = LLVMVectorType(i32_ty, 4);  // integer vector type for saturating ops
@@ -425,9 +428,9 @@ pub fn compileBlock(ops: []const IROp, guest_pc: u64) ?[]u8 {
         break :blk LLVMConstVector(&vals, 4);
     };
 
-    // fn(i64* %state) -> void
+    // fn(i64* %state, i64 %sp) -> i64   (returns taken branch target, 0 = not taken)
     var params = [_]TypeRef{ LLVMPointerType(i64_ty, 0), i64_ty };
-    const fn_ty = LLVMFunctionType(void_ty, &params, 2, 0);
+    const fn_ty = LLVMFunctionType(i64_ty, &params, 2, 0);
     const fn_ = LLVMAddFunction(module, mod_name, fn_ty);
     const entry_bb = LLVMAppendBasicBlock(fn_, "entry");
     LLVMPositionBuilderAtEnd(builder, entry_bb);
@@ -524,6 +527,7 @@ pub fn compileBlock(ops: []const IROp, guest_pc: u64) ?[]u8 {
     }
 
     // ── 4. Translate IR ops (with saSLP SIMD combining) ─────
+    var flag_state = FlagState{};
     var combine_skip: usize = std.math.maxInt(usize);
     for (ops, 0..) |op, i| {
         if (i == combine_skip) continue;
@@ -537,7 +541,40 @@ pub fn compileBlock(ops: []const IROp, guest_pc: u64) ?[]u8 {
             continue;
         }
 
-        emitOp(builder, module, sp_global, &reg_alloca, &vec_alloca, op, i64_ty, i32_ty, v4f32_ty, v4i32_ty, f32_ty) catch continue;
+        emitOp(builder, module, sp_global, &reg_alloca, &vec_alloca, op, i64_ty, i32_ty, v4f32_ty, v4i32_ty, f32_ty, &flag_state) catch continue;
+    }
+
+    // ── 4b. Terminal conditional branch ──────────────────────
+    // A region ending in br_cond returns the taken target (nonzero) or 0
+    // (not taken) so the runtime can dispatch the .cond successor.
+    var ret_val = LLVMConstInt(i64_ty, 0, 0);
+    if (ops.len > 0 and ops[ops.len - 1].tag == .br_cond) {
+        const br = ops[ops.len - 1];
+        const n = flag_state.n orelse LLVMConstInt(LLVMInt1Type(), 0, 0);
+        const z = flag_state.z orelse LLVMConstInt(LLVMInt1Type(), 0, 0);
+        const c = flag_state.c orelse LLVMConstInt(LLVMInt1Type(), 0, 0);
+        const v = flag_state.v orelse LLVMConstInt(LLVMInt1Type(), 0, 0);
+        const true1 = LLVMConstInt(LLVMInt1Type(), 1, 0);
+        const cond_i1: ValueRef = switch (br.flags & 0xF) {
+            0b0000 => z, // EQ
+            0b0001 => LLVMBuildNot(builder, z, "cne"), // NE
+            0b0010 => c, // CS/HS
+            0b0011 => LLVMBuildNot(builder, c, "ccc"), // CC/LO
+            0b0100 => n, // MI
+            0b0101 => LLVMBuildNot(builder, n, "cpl"), // PL
+            0b0110 => v, // VS
+            0b0111 => LLVMBuildNot(builder, v, "cvc"), // VC
+            0b1000 => LLVMBuildAnd(builder, c, LLVMBuildNot(builder, z, "cnz"), "chi"), // HI
+            0b1001 => LLVMBuildOr(builder, LLVMBuildNot(builder, c, "cnc"), z, "cls"), // LS
+            0b1010 => LLVMBuildICmp(builder, LLVMIntEQ, n, v, "cge"), // GE
+            0b1011 => LLVMBuildICmp(builder, LLVMIntNE, n, v, "clt"), // LT
+            0b1100 => LLVMBuildAnd(builder, LLVMBuildNot(builder, z, "cnz2"), LLVMBuildICmp(builder, LLVMIntEQ, n, v, "cge2"), "cgt"), // GT
+            0b1101 => LLVMBuildOr(builder, z, LLVMBuildICmp(builder, LLVMIntNE, n, v, "clt2"), "cle"), // LE
+            0b1110 => true1, // AL
+            else => null,
+        } orelse LLVMConstInt(LLVMInt1Type(), 0, 0);
+        const target = LLVMConstInt(i64_ty, br.imm, 0);
+        ret_val = LLVMBuildSelect(builder, cond_i1, target, ret_val, "nextpc");
     }
 
     // ── 5. Store back to state ───────────────────────────────
@@ -584,7 +621,11 @@ pub fn compileBlock(ops: []const IROp, guest_pc: u64) ?[]u8 {
             _ = LLVMBuildStore(builder, val, vgep);
         }
     }
-    _ = LLVMBuildRetVoid(builder);
+    _ = LLVMBuildRet(builder, ret_val);
+    if (getenv("A64TOX64_DUMPLLVM") != null) {
+        var err: ?[*:0]u8 = null;
+        _ = LLVMPrintModuleToFile(module, "/tmp/llvm_mod.ll", &err);
+    }
     _ = LLVMVerifyFunction(fn_, LLVMReturnStatusAction);
     LLVMDisposeBuilder(builder);
 
@@ -622,6 +663,12 @@ pub fn compileBlock(ops: []const IROp, guest_pc: u64) ?[]u8 {
     if (fn_addr == 0) return null;
     // Estimate code size from IR ops (LLVM ~12 bytes/op avg)
     const code_sz = @min(@as(usize, @intCast(ops.len * 16 + 128)), 4096);
+    if (getenv("A64TOX64_DUMPLLVM") != null) {
+        const n2 = @as(usize, 4096);
+        std.debug.print("LLVM block 0x{X:016} host=0x{X:016}:", .{ guest_pc, fn_addr });
+        for (@as([*]u8, @ptrFromInt(fn_addr))[0..n2]) |bb| std.debug.print(" {X:0>2}", .{bb});
+        std.debug.print("\n", .{});
+    }
         return @as([*]u8, @ptrFromInt(fn_addr))[0..code_sz];
 }
 
@@ -636,6 +683,23 @@ fn getIntrinsic(mod: ModuleRef, name: [*:0]const u8, ret_ty: TypeRef, param_tys:
     return f;
 }
 
+/// Tracked state for ARM64 NZCV flag computation (needed to evaluate
+/// conditional branches, which the hand emitter does via x86 flags and the
+/// LLVM backend must model explicitly). `result`/`lhs`/`rhs` are the LLVM
+/// values of the most recent ALU op; `kind` says whether it was a subtract
+/// (C = no borrow), add (C = carry out) or logical (C/V unchanged → 0).
+/// `nzcv` holds the computed flag values once the nzcv_update op runs.
+const FlagState = struct {
+    lhs: ?ValueRef = null,
+    rhs: ?ValueRef = null,
+    result: ?ValueRef = null,
+    kind: enum { none, add, sub, logical } = .none,
+    n: ?ValueRef = null,
+    z: ?ValueRef = null,
+    c: ?ValueRef = null,
+    v: ?ValueRef = null,
+};
+
 fn emitOp(
     b: BuilderRef,
     mod: ModuleRef,
@@ -648,6 +712,7 @@ fn emitOp(
     v4f32_ty: TypeRef,
     v4i32_ty: TypeRef,
     f32_ty: TypeRef,
+    flags: *FlagState,
 ) !void {
     const ty: TypeRef = switch (op.tag) {
         .add_i32, .sub_i32, .mul_i32 => i32_ty,
@@ -655,19 +720,52 @@ fn emitOp(
     };
 
     switch (op.tag) {
-        .add_i64, .add_i32 => emitBinop(b, regs, op, ty, LLVMBuildAdd),
-        .sub_i64, .sub_i32 => emitBinop(b, regs, op, ty, LLVMBuildSub),
-        .mul_i64, .mul_i32 => emitBinop(b, regs, op, ty, LLVMBuildMul),
-        .and_ => emitBinop(b, regs, op, ty, LLVMBuildAnd),
-        .or_ => emitBinop(b, regs, op, ty, LLVMBuildOr),
-        .xor_ => emitBinop(b, regs, op, ty, LLVMBuildXor),
-        .div_u64 => emitBinop(b, regs, op, ty, LLVMBuildUDiv),
-        .div_s64 => emitBinop(b, regs, op, ty, LLVMBuildSDiv),
+        .add_i64, .add_i32 => emitBinop(b, regs, op, ty, LLVMBuildAdd, flags),
+        .sub_i64, .sub_i32 => emitBinop(b, regs, op, ty, LLVMBuildSub, flags),
+        .mul_i64, .mul_i32 => emitBinop(b, regs, op, ty, LLVMBuildMul, flags),
+        .and_ => emitBinop(b, regs, op, ty, LLVMBuildAnd, flags),
+        .or_ => emitBinop(b, regs, op, ty, LLVMBuildOr, flags),
+        .xor_ => emitBinop(b, regs, op, ty, LLVMBuildXor, flags),
+        .div_u64 => emitBinop(b, regs, op, ty, LLVMBuildUDiv, flags),
+        .div_s64 => emitBinop(b, regs, op, ty, LLVMBuildSDiv, flags),
         .not_ => emitUnop(b, regs, op, ty, LLVMBuildNot),
         .neg_i64 => emitUnop(b, regs, op, ty, LLVMBuildNeg),
-        .lshl_i64, .lshl_i64_imm => emitBinop(b, regs, op, ty, LLVMBuildShl),
-        .lshr_i64, .lshr_i64_imm => emitBinop(b, regs, op, ty, LLVMBuildLShr),
-        .ashr_i64, .ashr_i64_imm => emitBinop(b, regs, op, ty, LLVMBuildAShr),
+        .lshl_i64, .lshl_i64_imm => emitBinop(b, regs, op, ty, LLVMBuildShl, flags),
+        .lshr_i64, .lshr_i64_imm => emitBinop(b, regs, op, ty, LLVMBuildLShr, flags),
+        .ashr_i64, .ashr_i64_imm => emitBinop(b, regs, op, ty, LLVMBuildAShr, flags),
+
+        .nzcv_update => {
+            // Compute ARM64 N/Z/C/V from the most recent ALU op so a later
+            // br_cond can be evaluated. imm=1 (CMC) means the last op was a
+            // subtract (C = !borrow); imm=0 add/logical (C = carry out / 0).
+            const res = flags.result orelse return;
+            const lhs = flags.lhs orelse return;
+            const rhs = flags.rhs orelse return;
+            const zero64 = LLVMConstInt(i64_ty, 0, 0);
+            flags.n = LLVMBuildICmp(b, LLVMIntSLT, res, zero64, "n");
+            flags.z = LLVMBuildICmp(b, LLVMIntEQ, res, zero64, "z");
+            if (flags.kind == .sub) {
+                // C = no borrow = lhs u>= result
+                flags.c = LLVMBuildICmp(b, LLVMIntUGE, lhs, res, "c");
+                // V = overflow = (lhs^rhs) & (result^lhs) sign bit
+                const x1 = LLVMBuildXor(b, lhs, rhs, "vx1");
+                const x2 = LLVMBuildXor(b, res, lhs, "vx2");
+                const a = LLVMBuildAnd(b, x1, x2, "va");
+                flags.v = LLVMBuildICmp(b, LLVMIntSLT, a, zero64, "v");
+            } else if (flags.kind == .add) {
+                // C = carry out = result u< lhs
+                flags.c = LLVMBuildICmp(b, LLVMIntULT, res, lhs, "c");
+                // V = overflow = (lhs^result) & (rhs^result) sign bit
+                const x1 = LLVMBuildXor(b, lhs, res, "vx1");
+                const x2 = LLVMBuildXor(b, rhs, res, "vx2");
+                const a = LLVMBuildAnd(b, x1, x2, "va");
+                flags.v = LLVMBuildICmp(b, LLVMIntSLT, a, zero64, "v");
+            } else {
+                // logical: C and V unchanged per ARM (approximated as 0)
+                flags.c = LLVMConstInt(LLVMInt1Type(), 0, 0);
+                flags.v = LLVMConstInt(LLVMInt1Type(), 0, 0);
+            }
+        },
 
         .mov_i64 => {
             if (op.src0 >= 31) { // XZR → zero immediate
@@ -693,6 +791,42 @@ fn emitOp(
             _ = LLVMBuildStore(b, val, dst);
         },
 
+        .load_u32 => {
+            if (op.src0 >= 31) return;
+            const base = regs[@as(usize, @intCast(op.src0))] orelse return;
+            const dst = regs[@as(usize, @intCast(op.dest))] orelse return;
+            const base_val = LLVMBuildLoad2(b, i64_ty, base, "base");
+            const off = LLVMConstInt(i64_ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+            const addr = LLVMBuildAdd(b, base_val, off, "addr");
+            const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(i32_ty, 0), "ptr32");
+            const val = LLVMBuildLoad2(b, i32_ty, ptr, "ld32");
+            _ = LLVMBuildStore(b, LLVMBuildZExt(b, val, i64_ty, "zext"), dst);
+        },
+
+        .load_u16 => {
+            if (op.src0 >= 31) return;
+            const base = regs[@as(usize, @intCast(op.src0))] orelse return;
+            const dst = regs[@as(usize, @intCast(op.dest))] orelse return;
+            const base_val = LLVMBuildLoad2(b, i64_ty, base, "base");
+            const off = LLVMConstInt(i64_ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+            const addr = LLVMBuildAdd(b, base_val, off, "addr");
+            const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(LLVMInt16Type(), 0), "ptr16");
+            const val = LLVMBuildLoad2(b, LLVMInt16Type(), ptr, "ld16");
+            _ = LLVMBuildStore(b, LLVMBuildZExt(b, val, i64_ty, "zext16"), dst);
+        },
+
+        .load_u8 => {
+            if (op.src0 >= 31) return;
+            const base = regs[@as(usize, @intCast(op.src0))] orelse return;
+            const dst = regs[@as(usize, @intCast(op.dest))] orelse return;
+            const base_val = LLVMBuildLoad2(b, i64_ty, base, "base");
+            const off = LLVMConstInt(i64_ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+            const addr = LLVMBuildAdd(b, base_val, off, "addr");
+            const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(LLVMInt8Type(), 0), "ptr8");
+            const val = LLVMBuildLoad2(b, LLVMInt8Type(), ptr, "ld8");
+            _ = LLVMBuildStore(b, LLVMBuildZExt(b, val, i64_ty, "zext8"), dst);
+        },
+
         .store_u64 => {
             if (op.src0 >= 31) return; // XZR base → no-op
             const base = regs[@as(usize, @intCast(op.src0))] orelse return;
@@ -703,6 +837,42 @@ fn emitOp(
             const addr = LLVMBuildAdd(b, base_val, off, "addr");
             const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(i64_ty, 0), "ptr");
             _ = LLVMBuildStore(b, src_val, ptr);
+        },
+
+        .store_u32 => {
+            if (op.src0 >= 31) return;
+            const base = regs[@as(usize, @intCast(op.src0))] orelse return;
+            const src = regs[@as(usize, @intCast(op.src1))] orelse return;
+            const base_val = LLVMBuildLoad2(b, i64_ty, base, "base");
+            const src_val = LLVMBuildLoad2(b, i64_ty, src, "src");
+            const off = LLVMConstInt(i64_ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+            const addr = LLVMBuildAdd(b, base_val, off, "addr");
+            const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(i32_ty, 0), "ptr32");
+            _ = LLVMBuildStore(b, LLVMBuildTrunc(b, src_val, i32_ty, "tr32"), ptr);
+        },
+
+        .store_u16 => {
+            if (op.src0 >= 31) return;
+            const base = regs[@as(usize, @intCast(op.src0))] orelse return;
+            const src = regs[@as(usize, @intCast(op.src1))] orelse return;
+            const base_val = LLVMBuildLoad2(b, i64_ty, base, "base");
+            const src_val = LLVMBuildLoad2(b, i64_ty, src, "src");
+            const off = LLVMConstInt(i64_ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+            const addr = LLVMBuildAdd(b, base_val, off, "addr");
+            const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(LLVMInt16Type(), 0), "ptr16");
+            _ = LLVMBuildStore(b, LLVMBuildTrunc(b, src_val, LLVMInt16Type(), "tr16"), ptr);
+        },
+
+        .store_u8 => {
+            if (op.src0 >= 31) return;
+            const base = regs[@as(usize, @intCast(op.src0))] orelse return;
+            const src = regs[@as(usize, @intCast(op.src1))] orelse return;
+            const base_val = LLVMBuildLoad2(b, i64_ty, base, "base");
+            const src_val = LLVMBuildLoad2(b, i64_ty, src, "src");
+            const off = LLVMConstInt(i64_ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+            const addr = LLVMBuildAdd(b, base_val, off, "addr");
+            const ptr = LLVMBuildIntToPtr(b, addr, LLVMPointerType(LLVMInt8Type(), 0), "ptr8");
+            _ = LLVMBuildStore(b, LLVMBuildTrunc(b, src_val, LLVMInt8Type(), "tr8"), ptr);
         },
 
         .br, .ret_ => {},
@@ -1394,26 +1564,34 @@ fn emitBinop(
     op: IROp,
     ty: TypeRef,
     comptime fn_binop: fn (BuilderRef, ValueRef, ValueRef, [*:0]const u8) callconv(.c) ValueRef,
+    flags: *FlagState,
 ) void {
-    // XZR dest (31) = CMP/CMN: discard result, only set flags
-    if (op.dest >= 31) return;
-    const dst = regs[@as(usize, @intCast(op.dest))] orelse return;
     const zero_val = LLVMConstInt(ty, 0, 0);
     const src0 = if (op.src0 >= 31) null else regs[@as(usize, @intCast(op.src0))];
     const src0val = if (src0) |s| LLVMBuildLoad2(b, ty, s, "lhs") else zero_val;
-    if (op.imm != 0) {
+    const rhs_val: ValueRef = if (op.imm != 0) blk: {
         // Sign-extend i32 imm to i64 for negative offsets (LDP/STP etc).
-        const rhs = LLVMConstInt(ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
-        const result = fn_binop(b, src0val, rhs, "res");
-        _ = LLVMBuildStore(b, result, dst);
-    } else if (op.src1 < 31) {
+        break :blk LLVMConstInt(ty, @as(u64, @bitCast(@as(i64, @intCast(@as(i32, @bitCast(op.imm)))))), 0);
+    } else if (op.src1 < 31) blk: {
         const src1 = regs[@as(usize, @intCast(op.src1))] orelse return;
-        const rhs = LLVMBuildLoad2(b, ty, src1, "rhs");
-        const result = fn_binop(b, src0val, rhs, "res");
-        _ = LLVMBuildStore(b, result, dst);
-    } else {
-        _ = LLVMBuildStore(b, src0val, dst);
-    }
+        break :blk LLVMBuildLoad2(b, ty, src1, "rhs");
+    } else zero_val;
+    const result = fn_binop(b, src0val, rhs_val, "res");
+    // Record ALU state for nzcv_update (CMP/CMN with dest=31 still sets flags).
+    flags.* = .{
+        .lhs = src0val,
+        .rhs = rhs_val,
+        .result = result,
+        .kind = switch (fn_binop) {
+            LLVMBuildSub => .sub,
+            LLVMBuildAdd => .add,
+            else => .logical,
+        },
+    };
+    // XZR dest (31) = CMP/CMN: discard result, only set flags
+    if (op.dest >= 31) return;
+    const dst = regs[@as(usize, @intCast(op.dest))] orelse return;
+    _ = LLVMBuildStore(b, result, dst);
 }
 
 fn emitVecBinop(
